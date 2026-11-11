@@ -501,6 +501,9 @@ impl DetailView {
         let library = Sonora::global(cx).library.clone();
         let detail = self.detail.read(cx);
         let id = detail.id()?.to_owned();
+        if state::is_smart(&id) {
+            return None;
+        }
 
         let (target, saved, busy) = match detail.header()?.kind {
             Collection::Album => (
@@ -563,6 +566,9 @@ impl DetailView {
         let downloads = sonora.downloads.clone();
         let detail = self.detail.read(cx);
         let id = detail.id()?.to_owned();
+        if state::is_smart(&id) {
+            return None;
+        }
         if music::is_local_id(&id) {
             return None;
         }
@@ -772,6 +778,9 @@ impl DetailView {
     fn menu(&self, cx: &App) -> Option<Menu> {
         let detail = self.detail.read(cx);
         let id = detail.id()?.to_owned();
+        if state::is_smart(&id) {
+            return None;
+        }
         let header = detail.header()?;
 
         Some(match header.kind {

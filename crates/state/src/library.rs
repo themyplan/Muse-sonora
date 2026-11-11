@@ -1656,6 +1656,11 @@ impl Library {
         })
     }
 
+    /// The shelf's favorite tracks, without cloning them.
+    pub fn favorite_tracks(&self, shelf: Shelf) -> &[Track] {
+        self.held(shelf).favorites().map_or(&[], |favorites| favorites.tracks)
+    }
+
     fn favorites(&self, id: &str) -> Option<Favorites<'_>> {
         self.held(Shelf::of(id)).favorites()
     }
@@ -2488,6 +2493,14 @@ impl Library {
     /// them back. They all have to sit on the shelf of the first. A failure after some went
     /// through stops the rest, and only the ones that went are reported.
     pub fn remove_playlists_from_library(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        // Smart playlists are derived, not stored, so they can never be removed.
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|id| !crate::smart::is_smart(id))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
         let Some(first) = ids.first() else {
             return;
         };

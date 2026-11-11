@@ -1,0 +1,78 @@
+name: build-fa
+
+# Builds the Persian (fa) Windows x64 version of Sonora and publishes it as a release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        default: fa-pilot
+      installer:
+        description: Also build the Inno Setup installer
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fa-x86_64-pc-windows-msvc
+          cache-on-failure: true
+
+      - name: i18n tests
+        shell: bash
+        run: cargo test --locked -p i18n
+
+      - name: build
+        shell: bash
+        run: cargo build --release --locked --package sonora --target x86_64-pc-windows-msvc
+
+      - name: stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/sonora.exe dist/sonora-fa.exe
+          Compress-Archive -Path dist/sonora-fa.exe -DestinationPath dist/sonora-fa-windows-x64.zip
+
+      - name: installer
+        if: ${{ inputs.installer }}
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          $env:SONORA_VERSION = "0.48.1"
+          @{ version = "0.48.1"; channel = "stable" } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM build.json
+          $env:SONORA_BUILD_METADATA = (Resolve-Path build.json).Path
+          $env:SONORA_EXE = (Resolve-Path "target/x86_64-pc-windows-msvc/release/sonora.exe").Path
+          $env:SONORA_DIST = (Resolve-Path "dist").Path
+          $env:SONORA_ARCH = "x64compatible"
+          $env:SONORA_SETUP = "Sonora-Setup-fa"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "scripts/windows/sonora.iss"
+
+      - name: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          rm -f dist/sonora-fa.exe
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --prerelease \
+            --title "Sonora فارسی ($TAG)" \
+            --notes "Persian (fa) build of Sonora v0.48.1 for Windows x64."

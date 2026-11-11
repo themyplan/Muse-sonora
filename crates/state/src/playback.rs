@@ -1320,6 +1320,20 @@ impl Playback {
         placement: QueuePlacement,
         cx: &mut Context<Self>,
     ) {
+        if crate::smart::is_smart(id) {
+            let tracks = crate::smart::smart_tracks(id, cx);
+            let source = match origin.as_ref().map(|origin| origin.whence) {
+                Some(Whence::Album) => "album",
+                Some(Whence::Playlist) => "playlist",
+                Some(Whence::Artist) => "artist",
+                _ => "track",
+            };
+            let placed = self.place(tracks, origin, placement, cx);
+            if let Some(key) = placed.and_then(|placed| placed.toast(source)) {
+                Toasts::show(Outcome::Done, key, cx);
+            }
+            return;
+        }
         if self.enqueue.is_some() {
             return;
         }
@@ -1420,6 +1434,16 @@ impl Playback {
     /// station. Shows Loading only when nothing plays yet, so a failure mid-playback is logged
     /// rather than shown.
     fn gather(&mut self, origin: Origin, shuffled: bool, cx: &mut Context<Self>) {
+        if crate::smart::is_smart(&origin.id) {
+            let tracks = crate::smart::smart_tracks(&origin.id, cx);
+            if shuffled && !tracks.is_empty() {
+                self.queue
+                    .update(cx, |queue, cx| queue.set_shuffle(true, cx));
+            }
+            let index = self.opener(&tracks, cx).unwrap_or_default();
+            self.begin(tracks, index, Some(origin), cx);
+            return;
+        }
         let Some(client) = self.client_for(&origin.id, cx) else {
             return;
         };

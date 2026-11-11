@@ -360,6 +360,10 @@ impl Detail {
         let (Some(kind), Some(id)) = (self.kind, self.id.clone()) else {
             return;
         };
+        if crate::smart::is_smart(&id) {
+            self.open_playlist(&id, cx);
+            return;
+        }
         self.clear();
         self.id = Some(id.clone());
         self.kind = Some(kind);

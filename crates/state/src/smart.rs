@@ -206,11 +206,9 @@ fn seed_play_counts(connection: &Connection) {
         return;
     }
     if let Err(error) = connection.execute(
-        "INSERT INTO play_counts (scope, provider, track_id, count, last_played_at)
+        "INSERT OR IGNORE INTO play_counts (scope, provider, track_id, count, last_played_at)
          SELECT scope, provider, track_id, COUNT(*), MAX(played_at) FROM plays
-         GROUP BY scope, provider, track_id
-         ON CONFLICT(scope, provider, track_id) DO UPDATE SET
-         count = excluded.count, last_played_at = excluded.last_played_at",
+         GROUP BY scope, provider, track_id",
         [],
     ) {
         log::warn!("smart playlists: cannot seed play counts: {error}");

@@ -776,11 +776,19 @@ impl Root {
     /// The font the window is set in, built again only once a different font is chosen.
     fn font(&mut self, cx: &App) -> Font {
         let chosen = Sonora::global(cx).settings.read(cx).font();
+        // The cache key also carries the language: Vazirmatn is the main font
+        // when Persian is active, so a language change must rebuild the font
+        // even though the chosen font name ("auto") did not change.
+        let persian = i18n::language() == i18n::Language::Persian;
+        let key = match persian {
+            true => format!("{chosen}:fa"),
+            false => chosen.to_owned(),
+        };
         match &self.font {
-            Some((name, font)) if name == chosen => font.clone(),
+            Some((name, font)) if *name == key => font.clone(),
             _ => {
-                let font = ui_font(chosen);
-                self.font = Some((chosen.to_owned(), font.clone()));
+                let font = ui_font(chosen, persian);
+                self.font = Some((key, font.clone()));
                 font
             }
         }
@@ -958,13 +966,19 @@ impl Root {
 
 const UI_FONT: &str = "Inter";
 
-const SCRIPTS: [&str; 18] = [
+/// Bundled in assets/fonts; the main font when Persian is the active language,
+/// so Persian text is measured with its own line height instead of falling back
+/// from Inter and sitting too low in buttons.
+const VAZIRMATN: &str = "Vazirmatn";
+
+const SCRIPTS: [&str; 19] = [
     "Source Han Sans",
     "Noto Sans CJK JP",
     "Noto Sans CJK SC",
     "Noto Sans CJK TC",
     "Noto Sans CJK KR",
     "Noto Sans Arabic",
+    "Vazirmatn",
     "Noto Sans Hebrew",
     "Noto Sans Thai",
     "Noto Sans Devanagari",
@@ -979,11 +993,14 @@ const SCRIPTS: [&str; 18] = [
     "Segoe UI Emoji",
 ];
 
-fn ui_font(chosen: &str) -> Font {
+fn ui_font(chosen: &str, persian: bool) -> Font {
     match chosen == SYSTEM_FONT {
         true => Font {
             fallbacks: Some(scripts(false).clone()),
-            ..font(UI_FONT)
+            ..font(match persian {
+                true => VAZIRMATN,
+                false => UI_FONT,
+            })
         },
         false => Font {
             fallbacks: Some(scripts(true).clone()),

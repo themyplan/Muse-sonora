@@ -312,6 +312,14 @@ impl LibraryView {
             cx.notify();
         })
         .detach();
+        // The smart strip follows plays as they land, so a new most-played song shows up
+        // without reopening the page.
+        let history = Sonora::global(cx).history.clone();
+        cx.observe(&history, |this, _, cx| {
+            this.cards_dirty = true;
+            cx.notify();
+        })
+        .detach();
         // The Downloaded filter follows downloads as they land, and not each redraw of their
         // progress, which would drop the open menu and the selection every time.
         let downloads = Sonora::global(cx).downloads.clone();
@@ -1116,6 +1124,44 @@ impl LibraryView {
         )
     }
 
+    /// The four automatic playlists, as cards above the stored playlists. The strip sits
+    /// outside the page's own scroller, so it stays fixed at the top while the lists below
+    /// scroll.
+    fn smart_strip(&self, window: &Window, cx: &App) -> AnyElement {
+        let theme = *cx.theme();
+        let inset = theme.metrics.inset;
+        let room = cells::content_width(window, page::reserved(inset), cx);
+        let layout = CardGrid::layout(room);
+        let playback = self.playback.clone();
+        let cards = state::smart_playlists(cx).into_iter().map(|playlist| {
+            let origin = Origin::playlist(playlist.id.clone()).named(playlist.name.clone());
+            let playing = playback.read(cx).playing_from(&origin, cx) == Some(true);
+            let opened = SharedString::from(playlist.id.clone());
+            let toggled = playback.clone();
+            let id = SharedString::from(format!("library-smart-{}", playlist.id));
+            Card::new(id, SharedString::from(playlist.name.clone()))
+                .cover(playlist.cover.clone())
+                .weight(FontWeight::SEMIBOLD)
+                .underline()
+                .meta(t!("count-songs", count = playlist.track_count))
+                .play(playing, move |_, _, cx| {
+                    toggled.update(cx, |playback, cx| playback.toggle_origin(&origin, cx));
+                })
+                .press(move |_, _, cx| navigate(Destination::Playlist(opened.clone()), cx))
+                .tile(layout.card)
+                .flat()
+                .into_any_element()
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px(inset)
+            .pt(inset)
+            .child(head(0, t!("smart-playlists"), cx))
+            .child(CardGrid::new(room).children(cards))
+    }
+
     fn artist_card(
         &self,
         display: usize,
@@ -1206,7 +1252,7 @@ impl Render for LibraryView {
             },
         };
 
-        div()
+        let page = div()
             .relative()
             .size_full()
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -1223,7 +1269,18 @@ impl Render for LibraryView {
                 });
             })
             .child(content)
-            .when_some(context_menu, |this, menu| this.child(menu))
+            .when_some(context_menu, |this, menu| this.child(menu));
+
+        if section == Section::Playlists && !self.unconfigured(cx) {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(self.smart_strip(window, cx))
+                .child(div().flex_1().child(page))
+                .into_any_element();
+        }
+        page.into_any_element()
     }
 }
 

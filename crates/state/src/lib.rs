@@ -34,6 +34,7 @@ mod session;
 mod settings;
 mod sheets;
 mod signal;
+mod smart;
 mod snapshot;
 mod song;
 mod tags;
@@ -88,6 +89,7 @@ pub use settings::{
     ThemeVariant, equalizer_profile_label, remember_window, window_placement,
 };
 pub use signal::{Change, Equalizing, FLOAT_BITS, Following, Signal, SignalPath};
+pub use smart::{is_smart, smart_playlist, smart_playlists, smart_tracks};
 pub use song::SongDetail;
 pub use tags::{TagState, Tags};
 pub use toast::{Outcome, Target, Toast, ToastAction, Toasts};

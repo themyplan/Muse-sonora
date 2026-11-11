@@ -146,6 +146,17 @@ impl Detail {
         })
         .detach();
 
+        // A smart page is built from plays and favorites, so it rebuilds whenever the
+        // history changes instead of waiting for the page to reopen.
+        if let Some(history) = cx.try_global::<Sonora>().map(|sonora| sonora.history.clone()) {
+            cx.observe(&history, |this, _, cx| {
+                if this.id.as_deref().is_some_and(crate::smart::is_smart) {
+                    this.reload(cx);
+                }
+            })
+            .detach();
+        }
+
         cx.observe(&library, |this, library, cx| {
             let Some(id) = this.id.clone() else {
                 return;
@@ -304,6 +315,11 @@ impl Detail {
             log::warn!("detail: cannot remove a track without a playlist");
             return;
         };
+        // A smart list is built from plays and favorites, not stored anywhere, so
+        // there is nothing to take a track out of.
+        if crate::smart::is_smart(&playlist_id) {
+            return;
+        };
         let named: HashSet<&str> = track_ids.iter().map(String::as_str).collect();
         let mut rows: Vec<String> = self
             .tracks
@@ -360,6 +376,10 @@ impl Detail {
     }
 
     pub fn open_playlist(&mut self, id: &str, cx: &mut Context<Self>) {
+        if crate::smart::is_smart(id) {
+            self.open_smart(id, cx);
+            return;
+        }
         let mut known = self.library.read(cx).playlist(id).cloned();
         let header = known.as_ref().map(playlist_header);
         if !self.open(Collection::Playlist, id, header, cx) {
@@ -377,6 +397,26 @@ impl Detail {
             self.header = Some(playlist_header(known));
         }
         self.playlist = known.or_else(|| self.playlist.take());
+    }
+
+    /// Opens one of the virtual smart playlists, built from the library and history
+    /// instead of the provider: a smart id never resolves through the catalog, so this
+    /// never calls `open` or any catalog lookup.
+    fn open_smart(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.clear();
+        self.id = Some(id.to_owned());
+        self.kind = Some(Collection::Playlist);
+        let Some(playlist) = crate::smart::smart_playlist(id, cx) else {
+            return;
+        };
+        let tracks = crate::smart::smart_tracks(id, cx);
+        self.header = Some(playlist_header(&playlist));
+        self.playlist = Some(playlist);
+        self.tracks = tracks;
+        self.continuation = None;
+        self.loaded = true;
+        self.loading = false;
+        cx.notify();
     }
 
     fn open(

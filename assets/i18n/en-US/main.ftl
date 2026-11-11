@@ -191,6 +191,13 @@ playlist-again-title = Add it again?
 playlist-again-confirm = This track is already in “{ $name }”. Add another copy?
 playlist-again-add = Add again
 
+# smart playlists
+smart-playlists = Smart playlists
+smart-favorites = Favorite songs
+smart-most-played = Most played
+smart-recently-added = Recently added
+smart-recently-played = Recently played
+
 # confirm
 confirm-remove-library-title = Remove from library
 confirm-remove-playlist-title = Remove from playlist

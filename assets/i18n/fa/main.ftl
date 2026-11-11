@@ -191,6 +191,13 @@ playlist-again-title = دوباره اضافه شود؟
 playlist-again-confirm = این آهنگ از قبل در «{ $name }» وجود دارد. یک نسخه دیگر اضافه شود؟
 playlist-again-add = افزودن دوباره
 
+# smart playlists
+smart-playlists = لیست‌های پخش خودکار
+smart-favorites = آهنگ‌های دلخواه
+smart-most-played = بیشترین پخش شده
+smart-recently-added = اخیراً اضافه شده
+smart-recently-played = اخیراً پخش شده
+
 # confirm
 confirm-remove-library-title = حذف از کتابخانه
 confirm-remove-playlist-title = حذف از لیست پخش

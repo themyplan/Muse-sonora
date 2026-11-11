@@ -161,6 +161,10 @@ impl Detail {
             let Some(id) = this.id.clone() else {
                 return;
             };
+            if crate::smart::is_smart(&id) {
+                this.reload(cx);
+                return;
+            }
             let Some(mut playlist) = library.read(cx).playlist(&id).cloned() else {
                 return;
             };

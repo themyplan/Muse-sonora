@@ -72,6 +72,17 @@ impl Store {
                 ],
             )
             .context("cannot save listening history")?;
+        if let Err(error) = self.open().and_then(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO play_counts (scope, provider, track_id, count, last_played_at) VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(scope, provider, track_id) DO UPDATE SET count = play_counts.count + 1, last_played_at = excluded.last_played_at",
+                    params![scope, provider, track_id, played_at],
+                )
+                .context("cannot save play count")
+        }) {
+            log::warn!("history: cannot save play count: {error:#}");
+        }
         self.prune(scope)
     }
 
@@ -172,6 +183,13 @@ impl Store {
 
     fn load(&self, scope: &str) -> Result<Vec<Track>> {
         let connection = self.open()?;
+        if let Err(error) = connection.execute(
+            "INSERT OR IGNORE INTO play_counts (scope, provider, track_id, count, last_played_at)
+             SELECT scope, provider, track_id, COUNT(*), MAX(played_at) FROM plays GROUP BY scope, provider, track_id",
+            params![],
+        ) {
+            log::warn!("history: cannot seed play counts: {error:#}");
+        }
         let mut query = connection
             .prepare(
                 "SELECT track_id, played_at, name, playable, artists, artist_refs, album,

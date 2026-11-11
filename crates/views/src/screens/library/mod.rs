@@ -1160,6 +1160,7 @@ impl LibraryView {
             .pt(inset)
             .child(head(0, t!("smart-playlists"), cx))
             .child(CardGrid::new(room).children(cards))
+            .into_any_element()
     }
 
     fn artist_card(

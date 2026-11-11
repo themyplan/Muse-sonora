@@ -187,9 +187,10 @@ fn recently_played_ids() -> Vec<String> {
     )
 }
 
-/// Counts the plays into `play_counts`, creating that table first: it is not
-/// part of the storage schema. The counts are refreshed on every call, so a
-/// track played again since the last count keeps its place.
+/// Seeds `play_counts` from the surviving plays, creating the table first as a
+/// guard (it also lives in the storage schema). Only rows that are missing are
+/// added: a row that already exists keeps its count, which the per-play upsert
+/// in history keeps going, so pruning the plays log can never lower a count.
 fn seed_play_counts(connection: &Connection) {
     if let Err(error) = connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS play_counts (

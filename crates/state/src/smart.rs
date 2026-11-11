@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{App, AppContext as _};
+use gpui::App;
 use music::{Playlist, Track};
 use rusqlite::Connection;
 

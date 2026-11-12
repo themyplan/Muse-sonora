@@ -424,6 +424,15 @@ struct Values {
     karaoke_lyrics: bool,
     blur_lyrics: bool,
     romanized_lyrics: bool,
+    /// Whether a Persian translation shows under each non-Persian lyrics line.
+    lyrics_translation_enabled: bool,
+    /// Which service translates lyrics.
+    translation_provider: music::lyrics::translate::Provider,
+    /// The base URL of an OpenAI-compatible translation endpoint. Empty means OpenAI's own.
+    translation_base_url: String,
+    /// The model name for an OpenAI-compatible translation endpoint. Empty means the provider
+    /// default. Only used for OpenAI-compatible endpoints.
+    translation_model: String,
     panel_lyrics_scale: f32,
     fullscreen_lyrics_scale: f32,
     romanization_scripts: RomanizationScripts,
@@ -629,6 +638,10 @@ impl Default for Values {
             karaoke_lyrics: true,
             blur_lyrics: true,
             romanized_lyrics: true,
+            lyrics_translation_enabled: true,
+            translation_provider: music::lyrics::translate::Provider::default(),
+            translation_base_url: String::new(),
+            translation_model: String::new(),
             panel_lyrics_scale: DEFAULT_LYRICS_SCALE,
             fullscreen_lyrics_scale: DEFAULT_LYRICS_SCALE,
             romanization_scripts: RomanizationScripts::default(),
@@ -1142,6 +1155,28 @@ impl AppSettings {
 
     pub fn romanized_lyrics(&self) -> bool {
         self.values.romanized_lyrics
+    }
+
+    pub fn lyrics_translation_enabled(&self) -> bool {
+        self.values.lyrics_translation_enabled
+    }
+
+    pub fn translation_provider(&self) -> music::lyrics::translate::Provider {
+        self.values.translation_provider
+    }
+
+    pub fn translation_base_url(&self) -> &str {
+        &self.values.translation_base_url
+    }
+
+    pub fn translation_model(&self) -> &str {
+        &self.values.translation_model
+    }
+
+    /// Whether a key for `provider` is saved in the app's credentials storage. A tiny file
+    /// check, read when the lyrics settings page renders.
+    pub fn translation_key_saved(&self, provider: music::lyrics::translate::Provider) -> bool {
+        music::lyrics::translate::has_translation_key(provider)
     }
 
     pub fn panel_lyrics_scale(&self) -> f32 {
@@ -1731,6 +1766,55 @@ impl AppSettings {
     pub fn set_romanized_lyrics(&mut self, romanized: bool, cx: &mut Context<Self>) {
         self.values.romanized_lyrics = romanized;
         self.schedule_save(cx);
+    }
+
+    pub fn set_lyrics_translation_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.values.lyrics_translation_enabled = enabled;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_translation_provider(
+        &mut self,
+        provider: music::lyrics::translate::Provider,
+        cx: &mut Context<Self>,
+    ) {
+        self.values.translation_provider = provider;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_translation_base_url(&mut self, url: String, cx: &mut Context<Self>) {
+        self.values.translation_base_url = url;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_translation_model(&mut self, model: String, cx: &mut Context<Self>) {
+        self.values.translation_model = model;
+        self.schedule_save(cx);
+    }
+
+    /// Saves a translation key for `provider` in the app's credentials storage, off the main
+    /// thread. The key never goes into `settings.json`, so this saves no settings. Google
+    /// needs no key and an empty key keeps the one already saved, so both are no-ops. The
+    /// settings page learns the outcome by re-reading [`Self::translation_key_saved`].
+    pub fn save_translation_key(
+        &mut self,
+        provider: music::lyrics::translate::Provider,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        if provider == music::lyrics::translate::Provider::Google || key.trim().is_empty() {
+            return;
+        }
+        cx.background_executor()
+            .spawn(async move {
+                match music::lyrics::translate::save_translation_key(provider, &key) {
+                    Ok(()) => log::info!("translation: saved a {provider:?} key"),
+                    Err(error) => {
+                        log::warn!("translation: cannot save a {provider:?} key: {error:#}")
+                    }
+                }
+            })
+            .detach();
     }
 
     pub fn set_panel_lyrics_scale(&mut self, scale: f32, cx: &mut Context<Self>) {

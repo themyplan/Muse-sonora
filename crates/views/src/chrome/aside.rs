@@ -236,6 +236,8 @@ pub(crate) struct Aside {
     departure: u64,
     lyrics_wrap_width: Option<Pixels>,
     lyrics_wrap_size: Option<Pixels>,
+    /// The font the wrapped rows were measured with. A change re-wraps them.
+    lyrics_wrap_font: Option<u64>,
     lyrics_wraps: HashMap<usize, Wrapped>,
     /// Wrapped rows of each line's Persian translation, kept with the text they were wrapped
     /// from, since a translation can land after the sheet is up and must never read another
@@ -344,6 +346,7 @@ impl Aside {
             departure: 0,
             lyrics_wrap_width: None,
             lyrics_wrap_size: None,
+            lyrics_wrap_font: None,
             lyrics_wraps: HashMap::new(),
             translation_wraps: HashMap::new(),
             lane_rooms: HashMap::new(),
@@ -1110,9 +1113,14 @@ impl Aside {
         let row_width = scroll.bounds().size.width - sheet_padding * 2.;
         // Both voices and wrapped phrases share the same inset from either panel edge.
         let wrap_width = (row_width - verse_pad * 2.).max(Pixels::ZERO);
-        if self.lyrics_wrap_width != Some(wrap_width) || self.lyrics_wrap_size != Some(wrap_size) {
+        let wrap_font = font_key(self.settings.read(cx).font());
+        if self.lyrics_wrap_width != Some(wrap_width)
+            || self.lyrics_wrap_size != Some(wrap_size)
+            || self.lyrics_wrap_font != Some(wrap_font)
+        {
             self.lyrics_wrap_width = Some(wrap_width);
             self.lyrics_wrap_size = Some(wrap_size);
+            self.lyrics_wrap_font = Some(wrap_font);
             self.forget_measurements();
             window.request_animation_frame();
         }
@@ -1126,7 +1134,7 @@ impl Aside {
             translation: show_translation,
             rem: window.rem_size(),
             scale: window.scale_factor(),
-            font: font_key(self.settings.read(cx).font()),
+            font: wrap_font,
         };
         let measured = self.laid.replace(false) && self.sheet_layout == Some(layout);
         self.sheet_layout = Some(layout);

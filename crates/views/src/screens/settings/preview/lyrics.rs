@@ -1,6 +1,7 @@
 //! A few sample lines of lyrics drawn by the lyrics sheet's own renderer the way Now playing
 //! draws them, held still in the middle of a karaoke line so every lyrics setting shows the
-//! moment it changes. The line being sung is in Japanese, so romanization has something to add.
+//! moment it changes. The line being sung is in Japanese, so romanization has something to
+//! add, and it carries a translation, so the translation lane shows too.
 
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ const SAMPLE: [&str; 5] = [
     "settings-lyrics-sample-fifth",
 ];
 const ROMANIZED: &str = "settings-lyrics-sample-romanized";
+const TRANSLATED: &str = "settings-lyrics-sample-translated";
 
 /// What the Lyrics page's preview keeps between frames, which is nothing, since it never moves.
 pub(in crate::screens::settings) struct LyricsPreview;
@@ -175,12 +177,15 @@ fn sample() -> Vec<LyricsLine> {
                 text: i18n::lookup(ROMANIZED, None).to_string(),
                 writing_system: WritingSystem::Japanese,
             });
+            let translated =
+                (index == SUNG_LINE).then(|| i18n::lookup(TRANSLATED, None).to_string());
             LyricsLine {
                 start,
                 end: Some(start + SUNG),
                 words: Some(timed(&text, start)),
                 text,
                 romanized,
+                translated,
                 ..Default::default()
             }
         })

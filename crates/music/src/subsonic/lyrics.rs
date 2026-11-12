@@ -137,6 +137,7 @@ fn sheet(entry: StructuredLyrics) -> Option<Lyrics> {
                     end: None,
                     text: line.value.trim().to_owned(),
                     romanized: None,
+                    translated: None,
                     words: None,
                     secondary: Vec::new(),
                     voice: Voice::Lead,

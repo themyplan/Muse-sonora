@@ -719,11 +719,18 @@ impl Lyrics {
             base_url: settings.translation_base_url().to_owned(),
             model: settings.translation_model().to_owned(),
         };
+        let io = self.io.clone();
         let http = self.http.clone();
         let lyrics = hit.lyrics.clone();
         self.translate_task = Some(cx.spawn(async move |this, cx| {
-            let outcome =
-                music::lyrics::translate::translate_sheet(&lyrics, &request, &http).await;
+            // The request runs on the tokio runtime, the way the lyrics lookups
+            // run theirs: hyper's DNS lookup panics with "there is no reactor
+            // running" when polled on GPUI's executor, and that panic aborts the
+            // whole process. A failure here only ever shows the original lyrics.
+            let outcome = join(io.spawn(async move {
+                music::lyrics::translate::translate_sheet(&lyrics, &request, &http).await
+            }))
+            .await;
             this.update(cx, |this, cx| {
                 if this.following.as_deref() != Some(id.as_str()) {
                     return;

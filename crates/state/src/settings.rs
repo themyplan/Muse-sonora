@@ -1792,29 +1792,34 @@ impl AppSettings {
         self.schedule_save(cx);
     }
 
-    /// Saves a translation key for `provider` in the app's credentials storage, off the main
-    /// thread. The key never goes into `settings.json`, so this saves no settings. Google
-    /// needs no key and an empty key keeps the one already saved, so both are no-ops. The
-    /// settings page learns the outcome by re-reading [`Self::translation_key_saved`].
+    /// Saves a translation key for `provider` in the app's credentials storage. The write
+    /// is tiny and runs here, on the main thread, so a second save cannot start before
+    /// the first has landed and the settings observer only ever sees the key after it
+    /// is stored. The key never goes into `settings.json`, so this saves no settings.
+    /// Google needs no key and an empty key keeps the one already saved, so both are
+    /// no-ops. A failed save is answered as an error, so the settings page can say so
+    /// instead of clearing the field; a saved key notifies, so the lyrics observer
+    /// starts the translation it was waiting for.
     pub fn save_translation_key(
         &mut self,
         provider: music::lyrics::translate::Provider,
         key: String,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<()> {
         if provider == music::lyrics::translate::Provider::Google || key.trim().is_empty() {
-            return;
+            return Ok(());
         }
-        cx.background_executor()
-            .spawn(async move {
-                match music::lyrics::translate::save_translation_key(provider, &key) {
-                    Ok(()) => log::info!("translation: saved a {provider:?} key"),
-                    Err(error) => {
-                        log::warn!("translation: cannot save a {provider:?} key: {error:#}")
-                    }
-                }
-            })
-            .detach();
+        match music::lyrics::translate::save_translation_key(provider, &key) {
+            Ok(()) => {
+                log::info!("translation: saved a {provider:?} key");
+                cx.notify();
+                Ok(())
+            }
+            Err(error) => {
+                log::warn!("translation: cannot save a {provider:?} key: {error:#}");
+                Err(error)
+            }
+        }
     }
 
     pub fn set_panel_lyrics_scale(&mut self, scale: f32, cx: &mut Context<Self>) {

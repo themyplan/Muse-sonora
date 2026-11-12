@@ -83,6 +83,7 @@ pub(crate) fn conform(worded: &Lyrics, guide: &Lyrics) -> Option<Lyrics> {
             end: Some(end.max(start)),
             text: line.text.clone(),
             romanized: None,
+            translated: None,
             words: Some(words),
             secondary: Vec::new(),
             voice: Voice::Lead,

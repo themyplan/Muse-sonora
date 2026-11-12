@@ -35,7 +35,7 @@ pub(crate) fn plain(text: &str) -> Option<RomanizedText> {
     })
 }
 
-fn detect<'a>(texts: impl Iterator<Item = &'a str>) -> Option<WritingSystem> {
+pub(crate) fn detect<'a>(texts: impl Iterator<Item = &'a str>) -> Option<WritingSystem> {
     let text = texts.collect::<Vec<_>>().join("\n");
     if text.chars().any(super::japanese::kana) {
         return Some(WritingSystem::Japanese);
@@ -156,6 +156,7 @@ mod tests {
             end: None,
             text: "Привет".to_owned(),
             romanized: None,
+            translated: None,
             words: None,
             secondary: vec![LyricsLane {
                 start: Duration::ZERO,

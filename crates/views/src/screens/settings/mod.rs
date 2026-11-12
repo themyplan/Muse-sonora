@@ -88,6 +88,12 @@ enum Slot {
     Karaoke,
     BlurLyrics,
     Romanized,
+    TranslationEnabled,
+    TranslationProvider,
+    TranslationKey,
+    TranslationBaseUrl,
+    TranslationModel,
+    TranslationSave,
     PanelLyricsSize,
     FullscreenLyricsSize,
     LyricsSources,
@@ -267,6 +273,14 @@ pub struct SettingsView {
     connect_name: Entity<Input>,
     /// The address of the listener's own Sonora Sessions server.
     sessions_server: Entity<Input>,
+    /// The API key typed for the selected translation provider. It starts empty and is never
+    /// pre-filled: a saved key is never read back into the UI, and typing here saves nothing
+    /// until the Save row below it is pressed.
+    translation_key: Entity<Input>,
+    /// The address of the listener's own OpenAI-compatible translation server.
+    translation_base_url: Entity<Input>,
+    /// The model the OpenAI-compatible translation server is asked for.
+    translation_model: Entity<Input>,
     /// The service whose link dialog is open, by slug.
     scrobble_prompt: Option<&'static str>,
     /// The provider whose sign-in choice is up, by slug and name.
@@ -403,6 +417,21 @@ impl SettingsView {
         cx.observe(&sessions_server, |_, _, cx| cx.notify())
             .detach();
 
+        // the key field starts empty and stays that way: a saved key is never read back, and
+        // typing one saves nothing until the Save row below it is pressed
+        let translation_key =
+            cx.new(|cx| Input::new("settings-translation-key-hint", cx).masked().compact());
+        // typing a key changes whether Save stands enabled, without saving anything
+        cx.observe(&translation_key, |_, _, cx| cx.notify())
+            .detach();
+        let translation_base_url =
+            cx.new(|cx| Input::new("settings-translation-base-url-hint", cx).compact());
+        let typed = settings.read(cx).translation_base_url().to_owned();
+        translation_base_url.update(cx, |input, cx| input.set_text(typed, cx));
+        let translation_model = cx.new(|cx| Input::new("settings-translation-model", cx).compact());
+        let typed = settings.read(cx).translation_model().to_owned();
+        translation_model.update(cx, |input, cx| input.set_text(typed, cx));
+
         let popovers = Popovers::default();
         let output_picker = cx.new(|cx| OutputPicker::new(outputs.clone(), popovers.clone(), cx));
         let previews = preview::Previews::new(cx);
@@ -448,6 +477,9 @@ impl SettingsView {
             scrobble_second: cx.new(|cx| Input::new("settings-scrobble-secret", cx)),
             connect_name,
             sessions_server,
+            translation_key,
+            translation_base_url,
+            translation_model,
             scrobble_prompt: None,
             languages,
             typefaces,
@@ -873,6 +905,33 @@ impl SettingsView {
                 t!("settings-romanized-lyrics"),
                 t!("settings-romanized-lyrics-detail"),
             ),
+            Slot::TranslationEnabled => (
+                t!("settings-lyrics-translation"),
+                t!("settings-lyrics-translation-detail"),
+            ),
+            Slot::TranslationProvider => {
+                let needs_key = self.settings.read(cx).translation_provider().needs_key();
+                let detail = match needs_key {
+                    true => SharedString::default(),
+                    false => t!("settings-translation-no-key-needed"),
+                };
+                (t!("settings-translation-provider"), detail)
+            }
+            Slot::TranslationKey => {
+                let settings = self.settings.read(cx);
+                let provider = settings.translation_provider();
+                let detail = match settings.translation_key_saved(provider) {
+                    true => t!("settings-translation-key-saved"),
+                    false => t!("settings-translation-key-hint"),
+                };
+                (t!("settings-translation-key"), detail)
+            }
+            Slot::TranslationBaseUrl => (
+                t!("settings-translation-base-url"),
+                t!("settings-translation-base-url-hint"),
+            ),
+            Slot::TranslationModel => (t!("settings-translation-model"), SharedString::default()),
+            Slot::TranslationSave => (t!("common-save"), SharedString::default()),
             Slot::LyricsForLocal => (
                 t!("settings-lyrics-for-local-files"),
                 t!("settings-lyrics-for-local-files-detail"),
@@ -1011,6 +1070,12 @@ impl SettingsView {
             Slot::Lyrics => self.lyrics_row(cx),
             Slot::Karaoke => self.karaoke_lyrics_row(cx),
             Slot::Romanized => self.romanized_lyrics_row(cx),
+            Slot::TranslationEnabled => self.translation_enabled_row(cx),
+            Slot::TranslationProvider => self.translation_provider_row(cx),
+            Slot::TranslationKey => self.translation_key_row(cx),
+            Slot::TranslationBaseUrl => self.translation_base_url_row(),
+            Slot::TranslationModel => self.translation_model_row(),
+            Slot::TranslationSave => self.translation_save_row(cx),
             Slot::LyricsForLocal => self.lyrics_for_local_files_row(cx),
             Slot::SpotifyConnect => self.spotify_connect_row(cx),
             Slot::SpotifyConnectName => self.spotify_connect_name_row(cx),

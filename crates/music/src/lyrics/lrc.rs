@@ -776,6 +776,7 @@ fn read(line: &str) -> Vec<LyricsLine> {
                 end: closed.filter(|end| *end > start),
                 text,
                 romanized: None,
+                translated: None,
                 words: words.map(|words| shifted(words, start)),
                 secondary: Vec::new(),
                 voice: Voice::Lead,
@@ -945,6 +946,7 @@ mod tests {
             end: Some(Duration::from_secs(4)),
             text: "Lead (echo) after".to_owned(),
             romanized: None,
+            translated: None,
             words: Some(vec![
                 LyricsWord {
                     start: Duration::from_secs(1),
@@ -986,6 +988,7 @@ mod tests {
             end: Some(Duration::from_secs(4)),
             text: "Может, я murder (E), они все".to_owned(),
             romanized: None,
+            translated: None,
             words: Some(vec![
                 LyricsWord {
                     start: Duration::from_secs(1),
@@ -1031,6 +1034,7 @@ mod tests {
                 end: Some(Duration::from_secs(2)),
                 text: "Lead".to_owned(),
                 romanized: None,
+                translated: None,
                 words: Some(vec![LyricsWord {
                     start: Duration::from_secs(1),
                     end: Duration::from_secs(2),
@@ -1044,6 +1048,7 @@ mod tests {
                 end: Some(Duration::from_secs(3)),
                 text: "(echo)".to_owned(),
                 romanized: None,
+                translated: None,
                 words: Some(vec![LyricsWord {
                     start: Duration::from_secs(2),
                     end: Duration::from_secs(3),

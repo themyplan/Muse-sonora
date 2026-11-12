@@ -4,6 +4,7 @@ pub mod lrc;
 pub(crate) mod romanize;
 mod shape;
 pub(crate) mod sheet;
+pub mod translate;
 pub(crate) mod ttml;
 
 use std::collections::HashSet;
@@ -347,6 +348,7 @@ mod tests {
             end: Some(Duration::from_secs(end)),
             text: text.to_owned(),
             romanized: None,
+            translated: None,
             words: None,
             secondary: Vec::new(),
             voice: Voice::Lead,

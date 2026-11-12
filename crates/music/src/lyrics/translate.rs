@@ -273,7 +273,7 @@ fn chunk_lines<'a>(wanted: &[(usize, &'a str)]) -> Vec<Vec<&'a str>> {
     let mut chunks: Vec<Vec<&str>> = Vec::new();
     let mut chunk: Vec<&str> = Vec::new();
     let mut width = 0usize;
-    for (_, &text) in wanted {
+    for &(_, text) in wanted {
         let line = text.chars().count();
         let joined = width + line + usize::from(!chunk.is_empty());
         if !chunk.is_empty() && joined > GOOGLE_CHUNK {

@@ -48,6 +48,7 @@ struct Look {
     karaoke: bool,
     blur: bool,
     scripts: Option<RomanizationScripts>,
+    translation: bool,
 }
 
 impl LyricsPreview {
@@ -82,6 +83,7 @@ pub(in crate::screens::settings) fn preview(
         scripts: settings
             .romanized_lyrics()
             .then(|| settings.romanization_scripts()),
+        translation: settings.lyrics_translation_enabled(),
     };
     let sizes = verse_sizes(false, settings.fullscreen_lyrics_scale(), &theme);
     let on = settings.lyrics_enabled();
@@ -120,6 +122,7 @@ fn lines(look: Look, sizes: (Pixels, Pixels), height: Pixels, theme: Theme) -> D
                 lane,
                 karaoke: look.karaoke,
                 scripts: look.scripts,
+                translation: look.translation,
                 haze,
             },
             position,

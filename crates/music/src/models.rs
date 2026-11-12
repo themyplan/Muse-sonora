@@ -358,6 +358,9 @@ pub enum Lyrics {
         /// One line for each line of `text`, blank where that line needs no romanization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         romanized: Option<RomanizedText>,
+        /// One line for each line of `text`, blank where that line needs no translation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        translated: Option<String>,
     },
     Synced {
         lines: Arc<[LyricsLine]>,
@@ -370,6 +373,7 @@ impl Default for Lyrics {
         Self::Plain {
             text: String::new(),
             romanized: None,
+            translated: None,
         }
     }
 }
@@ -378,7 +382,7 @@ impl Lyrics {
     pub fn plain(text: impl Into<String>) -> Self {
         let text = text.into();
         let romanized = crate::lyrics::romanize::plain(&text);
-        Self::Plain { text, romanized }
+        Self::Plain { text, romanized, translated: None }
     }
 
     pub fn synced(&self) -> bool {
@@ -419,6 +423,9 @@ pub struct LyricsLine {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub romanized: Option<RomanizedText>,
+    /// The line's Persian translation, when translated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translated: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub words: Option<Vec<LyricsWord>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

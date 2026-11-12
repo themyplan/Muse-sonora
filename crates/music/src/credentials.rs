@@ -40,10 +40,14 @@ pub(crate) fn dir(slug: &str) -> PathBuf {
     accounts().join(slug)
 }
 
-/// Writes a credential file readable by the owner alone, creating its folder first. The bytes
-/// go to a temporary file beside it that is synced and then renamed over the old one, so a
-/// crash leaves either the old sign-in or the new one and never half of either. It fails when
-/// the system names no data folder, rather than leaving credentials in the shared temp dir.
+/// Writes a credential file readable by the owner alone on unix, creating its folder
+/// first. Other platforms have no per-file owner-only mode here, so the file relies on
+/// the accounts folder's own protections there. The bytes go to a temporary file beside
+/// it that is synced and then renamed over the old one, so a crash leaves either the old
+/// sign-in or the new one and never half of either, and stale temporary files from
+/// interrupted writes are swept first, since a crash can leave key plaintext behind.
+/// It fails when the system names no data folder, rather than leaving credentials in
+/// the shared temp dir.
 pub(crate) fn write(path: &Path, contents: &[u8]) -> Result<()> {
     let private = dirs::data_local_dir().context("cannot find a private folder for credentials")?;
     if !path.starts_with(&private) {
@@ -61,6 +65,7 @@ pub(crate) fn write(path: &Path, contents: &[u8]) -> Result<()> {
         .file_name()
         .with_context(|| format!("cannot name a temporary file for {}", path.display()))?
         .to_string_lossy();
+    sweep_stale_temps(parent, &name);
     let temporary = parent.join(format!(
         ".{name}.{}.{}.tmp",
         std::process::id(),
@@ -78,7 +83,46 @@ pub(crate) fn write(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Restricts an existing credential file to its owner. A missing file is left alone.
+/// Removes temporary files an interrupted write left beside `name`: a crash between
+/// the write and the rename leaves key plaintext behind. Only files matching the
+/// writer's own pattern, `.name.pid.counter.tmp`, are removed, and never one this
+/// process is still writing.
+fn sweep_stale_temps(folder: &Path, name: &str) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    let prefix = format!(".{name}.");
+    let own = std::process::id();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(rest) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_suffix(".tmp") else {
+            continue;
+        };
+        let mut parts = rest.split('.');
+        let Ok(pid) = parts.next().unwrap_or("").parse::<u32>() else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        let counter = parts.next();
+        if parts.next().is_some()
+            || counter.is_none_or(|counter| counter.parse::<u64>().is_err())
+        {
+            continue;
+        }
+        remove(&entry.path());
+    }
+}
+
+/// Restricts an existing credential file to its owner on unix; elsewhere there is
+/// nothing to set. A missing file is left alone.
 pub(crate) fn secure(path: &Path) {
     #[cfg(unix)]
     {

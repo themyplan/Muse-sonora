@@ -40,8 +40,8 @@ impl Provider {
 }
 
 /// What a translation run needs: which provider to ask, and the base URL and model name
-/// from Settings. Empty strings mean the provider's own default, except for
-/// [`Provider::OpenAiCompatible`], which needs both spelled out.
+/// from Settings. Only [`Provider::OpenAiCompatible`] reads those two: Gemini and OpenAI
+/// always use their own endpoint and model, so a stale custom server can hijack neither.
 #[derive(Clone, Debug, Default)]
 pub struct TranslateRequest {
     pub provider: Provider,
@@ -71,6 +71,8 @@ pub enum FailureKind {
     UnexpectedShape,
     /// The Google endpoint answered, but no chunk could be read back.
     GoogleUnparseable,
+    /// The AI provider refused to translate the lyrics, or ran out of output room.
+    Blocked,
     /// The translation task was cancelled or panicked.
     Cancelled,
     /// The failure could not be classified.
@@ -90,6 +92,7 @@ impl FailureKind {
             Self::NoModel => "no-model".to_owned(),
             Self::UnexpectedShape => "unexpected-shape".to_owned(),
             Self::GoogleUnparseable => "google-unparseable".to_owned(),
+            Self::Blocked => "blocked".to_owned(),
             Self::Cancelled => "cancelled".to_owned(),
             Self::Unknown => "unknown".to_owned(),
         }
@@ -105,6 +108,12 @@ impl FailureKind {
     /// never completed. A rejected request or an unreadable answer would fail again.
     pub fn is_retryable(self) -> bool {
         matches!(self, Self::Connect | Self::Timeout)
+    }
+
+    /// Whether the provider rate-limited the run: only a 429. A rate-limited run
+    /// waits and tries once more, later.
+    pub fn is_rate_limited(self) -> bool {
+        matches!(self, Self::Status(429))
     }
 
     /// Classifies an error by what it carries: a kind attached by the translation
@@ -143,9 +152,10 @@ impl FailureKind {
 }
 
 /// An error that carries only a [`FailureKind`], so the reason a run failed survives
-/// to the caller without ever naming a URL, a key, or lyrics text.
+/// to the caller without ever naming a URL, a key, or lyrics text. A rate limit may
+/// also carry the wait the provider asked for.
 #[derive(Debug)]
-pub struct KindedError(FailureKind);
+pub struct KindedError(FailureKind, Option<Duration>);
 
 impl std::fmt::Display for KindedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -181,6 +191,16 @@ pub fn classify_error(error: &anyhow::Error, request: &TranslateRequest) -> Fail
     }
 }
 
+/// The wait a rate-limited run was asked for, when the error carries one. Like the
+/// classifier, only the kind attached by the translation code itself is read, never
+/// an error message, which can name the request URL.
+pub fn failure_delay(error: &anyhow::Error) -> Option<Duration> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<KindedError>())
+        .and_then(|kinded| kinded.1)
+}
+
 /// A client for one translation run: fresh, so no pooled connection from an earlier
 /// run is reused, with bounded waits, so a failure surfaces in seconds instead of
 /// hanging on the operating system's own timeouts.
@@ -206,14 +226,14 @@ const GOOGLE_URL: &str = "https://translate.googleapis.com/translate_a/single";
 /// The Gemini API root, with the model name appended per request.
 const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
-/// OpenAI's own API root, used when Settings names no other base URL.
+/// OpenAI's own API root, which every OpenAI run uses.
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
 
-/// The Gemini model used when Settings names none.
-const GEMINI_MODEL: &str = "gemini-2.5-flash";
+/// The Gemini model every Gemini run uses.
+const GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
-/// The OpenAI model used when Settings names none.
-const OPENAI_MODEL: &str = "gpt-4o-mini";
+/// The OpenAI model every OpenAI run uses.
+const OPENAI_MODEL: &str = "gpt-6-luna";
 
 /// The instruction every AI provider gets, asking for a translation line by line.
 const INSTRUCTION: &str = "Translate each line of the following song lyrics to Persian, one line at a time. Keep the same number of lines and the same order, with exactly one translation per line. Do not add explanations, numbering, or extra lines. Leave lines that contain only symbols unchanged.";
@@ -330,14 +350,12 @@ fn join_lines(wanted: &[(usize, &str)]) -> String {
         .join("\n")
 }
 
-/// The model name from Settings, trimmed, or the provider default when Settings names
-/// none.
-fn model_or<'a>(request: &'a TranslateRequest, default: &'a str) -> &'a str {
-    let model = request.model.trim();
-    if model.is_empty() {
-        default
-    } else {
-        model
+/// Logs when an AI answer holds a different number of lines than were sent, a silent
+/// misalignment signal. Only the counts are logged, never lyrics text.
+fn log_line_mismatch(name: &str, answer: &str, wanted: usize) {
+    let lines = answer.lines().count();
+    if lines != wanted {
+        log::debug!("lyrics: {name} answered {lines} lines for {wanted} wanted");
     }
 }
 
@@ -379,13 +397,15 @@ fn single_line(answer: &str) -> Option<String> {
 /// Translates `wanted` through the free Google endpoint, in chunks of at most
 /// [`GOOGLE_CHUNK`] characters joined with newlines. A chunk whose answer cannot be split
 /// back into the lines that were sent is retried line by line. A line that still fails
-/// stays `None`; when every line fails, the whole run fails.
+/// stays `None`; when every line fails, the whole run fails. A rate limit fails the
+/// whole run at once, even when earlier chunks translated: a partial answer would
+/// count the sheet as translated and block the retry the rate limit is owed.
 async fn translate_google(
     wanted: &[(usize, &str)],
     http: &reqwest::Client,
 ) -> anyhow::Result<Vec<Option<String>>> {
     let mut translated = Vec::with_capacity(wanted.len());
-    let mut first_failure: Option<FailureKind> = None;
+    let mut first_failure: Option<(FailureKind, Option<Duration>)> = None;
     for chunk in chunk_lines(wanted) {
         let joined = chunk.join("\n");
         match google_answer(http, &joined).await {
@@ -395,7 +415,17 @@ async fn translate_google(
                 match aligned {
                     Some(lines) => translated.extend(lines),
                     None => {
-                        translate_google_line_by_line(http, &chunk, &mut translated).await;
+                        let line_failure =
+                            translate_google_line_by_line(http, &chunk, &mut translated).await;
+                        if let Some((FailureKind::Status(429), delay)) = line_failure {
+                            return Err(anyhow::Error::new(KindedError(
+                                FailureKind::Status(429),
+                                delay,
+                            )));
+                        }
+                        if first_failure.is_none() {
+                            first_failure = line_failure;
+                        }
                     }
                 }
             }
@@ -404,17 +434,24 @@ async fn translate_google(
                 // the failure. The chunk stays untranslated, and the first failure's
                 // kind is kept so the caller can say why the run failed.
                 let kind = FailureKind::from_error(&error).unwrap_or(FailureKind::Unknown);
+                let delay = failure_delay(&error);
+                if kind.is_rate_limited() {
+                    return Err(anyhow::Error::new(KindedError(kind, delay)));
+                }
                 log::debug!("lyrics: google chunk failed: {}", kind.token());
                 if first_failure.is_none() {
-                    first_failure = Some(kind);
+                    first_failure = Some((kind, delay));
                 }
                 translated.extend(std::iter::repeat_n(None, chunk.len()));
             }
         }
     }
     if !translated.is_empty() && translated.iter().all(Option::is_none) {
-        let kind = first_failure.unwrap_or(FailureKind::GoogleUnparseable);
-        return Err(anyhow::Error::new(KindedError(kind)));
+        let (kind, delay) = first_failure.unwrap_or((FailureKind::GoogleUnparseable, None));
+        return Err(anyhow::Error::new(KindedError(kind, delay)));
+    }
+    if let Some((kind, _)) = first_failure {
+        log::warn!("lyrics: google translation is partial: {}", kind.token());
     }
     Ok(translated)
 }
@@ -446,25 +483,39 @@ fn chunk_lines<'a>(wanted: &[(usize, &'a str)]) -> Vec<Vec<&'a str>> {
 }
 
 /// Translates each line of a chunk on its own, after the joined answer could not be split
-/// back. A line that fails stays `None` without failing the rest.
+/// back. A line whose answer cannot be read stays `None` without failing the rest, but
+/// the first request failure stops the chunk: the endpoint, not the line, is the
+/// problem. Answers the first failure's kind and asked-for wait, if any, so the caller
+/// can say why the run failed instead of blaming an unreadable answer.
 async fn translate_google_line_by_line(
     http: &reqwest::Client,
     chunk: &[&str],
     translated: &mut Vec<Option<String>>,
-) {
-    for &line in chunk {
-        let answer = google_answer(http, line)
-            .await
-            .ok()
-            .and_then(|body| parse_google_body(&body))
-            .and_then(|answer| single_line(&answer));
-        translated.push(answer);
+) -> Option<(FailureKind, Option<Duration>)> {
+    for (index, &line) in chunk.iter().enumerate() {
+        match google_answer(http, line).await {
+            Ok(body) => {
+                let answer = parse_google_body(&body).and_then(|answer| single_line(&answer));
+                translated.push(answer);
+            }
+            Err(error) => {
+                let kind = FailureKind::from_error(&error).unwrap_or(FailureKind::Unknown);
+                log::debug!("lyrics: google line failed: {}", kind.token());
+                translated.extend(std::iter::repeat_n(None, chunk.len() - index));
+                return Some((kind, failure_delay(&error)));
+            }
+        }
     }
+    None
 }
 
 /// Asks the free Google endpoint to translate `text`, answering the raw response body.
+/// An error status answers a classified error carrying the wait the endpoint asked
+/// for, read before the response is dropped: the usual error helper throws the
+/// headers away with it.
 async fn google_answer(http: &reqwest::Client, text: &str) -> anyhow::Result<String> {
-    http.post(GOOGLE_URL)
+    let response = http
+        .post(GOOGLE_URL)
         .query(&[
             ("client", "gtx"),
             ("sl", "auto"),
@@ -486,12 +537,28 @@ async fn google_answer(http: &reqwest::Client, text: &str) -> anyhow::Result<Str
         .form(&[("q", text)])
         .send()
         .await
-        .context("Google Translate request failed")?
-        .error_for_status()
-        .context("Google Translate request failed")?
+        .context("Google Translate request failed")?;
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        let delay = retry_after(response.headers());
+        return Err(anyhow::Error::new(KindedError(
+            FailureKind::Status(status.as_u16()),
+            delay,
+        )));
+    }
+    response
         .text()
         .await
         .context("Google Translate request failed")
+}
+
+/// The wait a provider asked for, when it named one in seconds. The HTTP-date form of
+/// the header is not read: a date is only ever a longer wait than the caller would
+/// sit through anyway.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let asked = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds = asked.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 /// Reads the translation out of a Google response body. The usual shape is an array whose
@@ -536,7 +603,17 @@ async fn translate_gemini(
 ) -> anyhow::Result<Vec<Option<String>>> {
     let key = load_translation_key(Provider::Gemini)
         .context("Gemini needs an API key in Settings")?;
-    let model = model_or(request, GEMINI_MODEL);
+    // Gemini always uses its own model: the model name in Settings belongs to the
+    // OpenAI-compatible provider, and a stale one here used to ask for a model that
+    // does not exist. The name is checked before it reaches the URL all the same.
+    let model = GEMINI_MODEL;
+    if model.is_empty()
+        || !model
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric() || matches!(letter, '.' | '_' | '-'))
+    {
+        anyhow::bail!("Gemini answered in an unexpected shape");
+    }
     let url = format!("{GEMINI_URL}/{model}:generateContent");
     let prompt = format!("{INSTRUCTION}\n\n{}", join_lines(wanted));
     let body = http
@@ -554,23 +631,52 @@ async fn translate_gemini(
         .json::<serde_json::Value>()
         .await
         .context("Gemini request failed")?;
-    let answer = body
+    let candidate = body
         .get("candidates")
         .and_then(serde_json::Value::as_array)
         .and_then(|candidates| candidates.first())
-        .and_then(|candidate| candidate.get("content"))
+        .context("Gemini answered in an unexpected shape")?;
+    // A blocked prompt or a cut-short answer is neither a shape the code
+    // misunderstands nor a key problem: the provider refused this text, or ran
+    // out of room.
+    let blocked = body
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        || matches!(
+            candidate
+                .get("finishReason")
+                .and_then(serde_json::Value::as_str),
+            Some("SAFETY") | Some("MAX_TOKENS")
+        );
+    if blocked {
+        return Err(anyhow::Error::new(KindedError(
+            FailureKind::Blocked,
+            None,
+        )));
+    }
+    let parts = candidate
+        .get("content")
         .and_then(|content| content.get("parts"))
         .and_then(serde_json::Value::as_array)
-        .and_then(|parts| parts.first())
-        .and_then(|part| part.get("text"))
-        .and_then(serde_json::Value::as_str)
         .context("Gemini answered in an unexpected shape")?;
-    Ok(align_lenient(answer, wanted.len()))
+    let mut answer = String::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+            answer.push_str(text);
+        }
+    }
+    if answer.is_empty() {
+        anyhow::bail!("Gemini answered in an unexpected shape");
+    }
+    log_line_mismatch("Gemini", &answer, wanted.len());
+    Ok(align_lenient(&answer, wanted.len()))
 }
 
 /// Translates `wanted` through OpenAI or an OpenAI-compatible endpoint, in a single
 /// request carrying every line. An OpenAI-compatible endpoint needs both a base URL and a
-/// model name in Settings; OpenAI's own endpoint falls back to its defaults. The key
+/// model name in Settings; OpenAI's own endpoint always uses its own. The key
 /// comes from the app's credentials storage and never appears in an error or a log line.
 async fn translate_openai(
     wanted: &[(usize, &str)],
@@ -579,6 +685,9 @@ async fn translate_openai(
 ) -> anyhow::Result<Vec<Option<String>>> {
     let provider = request.provider;
     let name = provider.name();
+    // Only the OpenAI-compatible provider reads the base URL and model name from
+    // Settings: OpenAI always uses its own endpoint and model, so a stale custom
+    // server can neither redirect it nor ask it for a model it does not serve.
     let base = match provider {
         Provider::OpenAiCompatible => {
             let base = request.base_url.trim();
@@ -587,14 +696,7 @@ async fn translate_openai(
             }
             base
         }
-        _ => {
-            let base = request.base_url.trim();
-            if base.is_empty() {
-                OPENAI_BASE
-            } else {
-                base
-            }
-        }
+        _ => OPENAI_BASE,
     };
     let model = match provider {
         Provider::OpenAiCompatible => {
@@ -604,22 +706,31 @@ async fn translate_openai(
             }
             model
         }
-        _ => model_or(request, OPENAI_MODEL),
+        _ => OPENAI_MODEL,
     };
     let key = load_translation_key(provider)
         .with_context(|| format!("{name} needs an API key in Settings"))?;
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let base = base.trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    let url = format!("{base}/chat/completions");
+    let mut payload = serde_json::json!({
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            { "role": "system", "content": INSTRUCTION },
+            { "role": "user", "content": join_lines(wanted) },
+        ],
+    });
+    // A reasoning model turns `temperature` down unless it is told not to reason.
+    // Only OpenAI's own model is told: the compatible path names its own model,
+    // which may not be a reasoning one at all.
+    if provider == Provider::OpenAI && model.starts_with("gpt-6") {
+        payload["reasoning_effort"] = serde_json::json!("none");
+    }
     let body = http
         .post(url)
         .bearer_auth(key)
-        .json(&serde_json::json!({
-            "model": model,
-            "temperature": 0,
-            "messages": [
-                { "role": "system", "content": INSTRUCTION },
-                { "role": "user", "content": join_lines(wanted) },
-            ],
-        }))
+        .json(&payload)
         .send()
         .await
         .with_context(|| format!("{name} request failed"))?
@@ -628,15 +739,24 @@ async fn translate_openai(
         .json::<serde_json::Value>()
         .await
         .with_context(|| format!("{name} request failed"))?;
-    let answer = body
+    let content = body
         .get("choices")
         .and_then(serde_json::Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
         .and_then(|message| message.get("content"))
-        .and_then(serde_json::Value::as_str)
         .with_context(|| format!("{name} answered in an unexpected shape"))?;
-    Ok(align_lenient(answer, wanted.len()))
+    // The answer is usually one string; some endpoints send its parts instead.
+    let answer: String = match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+        _ => anyhow::bail!("{} answered in an unexpected shape", name),
+    };
+    log_line_mismatch(name, &answer, wanted.len());
+    Ok(align_lenient(&answer, wanted.len()))
 }
 
 /// The file that holds every saved translation key, inside the app's credentials storage.
@@ -663,15 +783,37 @@ fn saved_keys() -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// The keys saved so far, failing when the keys file exists but cannot be read: a
+/// save must never treat a corrupt file as empty and wipe the other providers' keys
+/// with the next write. A missing file means no keys are saved.
+fn saved_keys_checked() -> anyhow::Result<BTreeMap<String, String>> {
+    let body = match std::fs::read(keys_path()) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(error) => return Err(error).context("cannot read the saved keys"),
+    };
+    serde_json::from_slice(&body).context("cannot read the saved keys")
+}
+
 /// Saves `key` for `provider` in the app's credentials storage, where only the owner can
-/// read it. An empty key deletes the saved key for that provider, and when no key is left
-/// the file itself is removed. Google needs no key, so saving one for it does nothing.
-/// Keys never go into settings, and are never logged.
+/// read it. An empty key removes the saved key for that provider, and when no key is left
+/// the file itself is removed, but Settings never sends an empty key: from the settings
+/// page a key can only be replaced, never deleted. When the keys file exists but cannot
+/// be read, the save fails instead of wiping the keys it holds. Google needs no key, so
+/// saving one for it does nothing. Keys never go into settings, and are never logged.
 pub fn save_translation_key(provider: Provider, key: &str) -> anyhow::Result<()> {
     let Some(slot) = key_slot(provider) else {
         return Ok(());
     };
-    let mut keys = saved_keys();
+    let mut keys = match saved_keys_checked() {
+        Ok(keys) => keys,
+        Err(error) => {
+            log::warn!("translation: the saved keys cannot be read, so no key was saved");
+            return Err(error).context("cannot store the translation key");
+        }
+    };
     let key = key.trim();
     if key.is_empty() {
         keys.remove(slot);
@@ -747,6 +889,7 @@ mod tests {
             FailureKind::GoogleUnparseable.token(),
             "google-unparseable"
         );
+        assert_eq!(FailureKind::Blocked.token(), "blocked");
         assert_eq!(FailureKind::Cancelled.token(), "cancelled");
         assert_eq!(FailureKind::Unknown.token(), "unknown");
     }
@@ -761,6 +904,7 @@ mod tests {
         assert!(!FailureKind::Connect.is_key_error());
         assert!(!FailureKind::Timeout.is_key_error());
         assert!(!FailureKind::GoogleUnparseable.is_key_error());
+        assert!(!FailureKind::Blocked.is_key_error());
     }
 
     #[test]
@@ -771,11 +915,22 @@ mod tests {
         assert!(!FailureKind::Status(429).is_retryable());
         assert!(!FailureKind::NoKey.is_retryable());
         assert!(!FailureKind::UnexpectedShape.is_retryable());
+        assert!(!FailureKind::Blocked.is_retryable());
+    }
+
+    #[test]
+    fn only_rate_limits_are_rate_limited() {
+        assert!(FailureKind::Status(429).is_rate_limited());
+        assert!(!FailureKind::Status(403).is_rate_limited());
+        assert!(!FailureKind::Status(404).is_rate_limited());
+        assert!(!FailureKind::Connect.is_rate_limited());
+        assert!(!FailureKind::Timeout.is_rate_limited());
+        assert!(!FailureKind::Blocked.is_rate_limited());
     }
 
     #[test]
     fn a_classified_failure_survives_the_error_chain() {
-        let error = anyhow::Error::new(KindedError(FailureKind::Connect));
+        let error = anyhow::Error::new(KindedError(FailureKind::Connect, None));
         assert_eq!(
             classify_error(&error, &TranslateRequest::default()),
             FailureKind::Connect

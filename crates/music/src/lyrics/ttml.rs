@@ -101,6 +101,7 @@ fn line(paragraph: Node, lead: Option<&str>, singers: &HashMap<&str, bool>) -> O
         end: end.map(|end| end.max(start)),
         text,
         romanized: None,
+        translated: None,
         words: (!words.is_empty()).then_some(words),
         secondary,
         voice: voice(paragraph, lead, singers),

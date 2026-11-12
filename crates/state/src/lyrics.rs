@@ -22,6 +22,14 @@ pub enum LyricsState {
 
 const SAVE_DELAY: Duration = Duration::from_millis(800);
 
+/// How long a rate-limited translation waits before its one retry, when the provider
+/// named no wait of its own.
+const TRANSLATE_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+/// The shortest and longest a rate-limited translation waits before its one retry.
+const TRANSLATE_RETRY_MIN: Duration = Duration::from_secs(10);
+const TRANSLATE_RETRY_MAX: Duration = Duration::from_secs(120);
+
 /// How many tracks keep their answer in memory. The rest are read back from the cache database,
 /// so this only has to cover the track playing, the next one and a few just played.
 const RECENT: usize = 16;
@@ -56,6 +64,9 @@ pub struct Lyrics {
     ahead_of: Option<String>,
     save: Option<Task<()>>,
     translate_task: Option<Task<()>>,
+    /// Counts every translation run. A run whose number no longer matches was
+    /// superseded, and its answer is dropped without touching the slot.
+    translate_generation: u64,
     /// The track and provider a translation failure was already toasted for, so a failure
     /// is reported once per track until the provider changes or another track plays.
     translate_failed_for: Option<(String, String)>,
@@ -64,6 +75,13 @@ pub struct Lyrics {
     translation_enabled: bool,
     /// The name of the translation provider, as the settings last said.
     translation_provider_name: String,
+    /// Whether a key is saved for the translation provider, as the settings last
+    /// said. A key saved while a provider waits for one starts its translation.
+    translation_has_key: bool,
+    /// The custom server's address and model name, as the settings last said. An edit
+    /// re-translates a sheet that has none yet, without clearing what is there.
+    translation_base_url: String,
+    translation_model: String,
     /// Moves the old lyrics.json into the cache database, once.
     _migration: Task<()>,
 }
@@ -90,17 +108,30 @@ impl Lyrics {
             let enabled = settings.lyrics_providers();
             let priority = settings.lyrics_provider_priority();
             let translation_on = settings.lyrics_translation_enabled();
-            let translation_provider = settings.translation_provider().name().to_owned();
+            let translation_provider = settings.translation_provider();
+            let translation_provider_name = translation_provider.name().to_owned();
+            let translation_has_key =
+                music::lyrics::translate::has_translation_key(translation_provider);
+            let translation_base_url = settings.translation_base_url().to_owned();
+            let translation_model = settings.translation_model().to_owned();
             let lyrics_changed =
                 on != this.enabled || enabled != this.enabled_providers || priority != this.priority;
+            let provider_changed = translation_provider_name != this.translation_provider_name;
+            let key_flipped = !this.translation_has_key && translation_has_key;
+            let base_or_model_changed = translation_base_url != this.translation_base_url
+                || translation_model != this.translation_model;
             let translation_changed = translation_on != this.translation_enabled
-                || translation_provider != this.translation_provider_name;
+                || provider_changed
+                || translation_has_key != this.translation_has_key
+                || base_or_model_changed;
             if !lyrics_changed && !translation_changed {
                 return;
             }
-            let provider_changed = translation_provider != this.translation_provider_name;
             this.translation_enabled = translation_on;
-            this.translation_provider_name = translation_provider;
+            this.translation_provider_name = translation_provider_name;
+            this.translation_has_key = translation_has_key;
+            this.translation_base_url = translation_base_url;
+            this.translation_model = translation_model;
             if lyrics_changed {
                 this.enabled = on;
                 this.enabled_providers = enabled.to_vec();
@@ -109,33 +140,49 @@ impl Lyrics {
                 this.ahead = None;
                 this.ahead_of = None;
                 this.translate_task = None;
+                this.translate_generation = this.translate_generation.wrapping_add(1);
                 this.translate_failed_for = None;
                 this.forget(cx);
                 this.follow(cx);
                 return;
             }
-            // Only the translation settings changed, so the lyrics on screen stay: a new
-            // provider translates them again, and switching translation off only hides the
-            // translated lanes until it is switched back on.
-            if provider_changed {
-                this.clear_translations();
-                this.translate_failed_for = None;
+            // Only the translation settings changed, so the lyrics on screen stay, and
+            // any translation already running is superseded: its answer belongs to
+            // settings that no longer hold.
+            this.translate_generation = this.translate_generation.wrapping_add(1);
+            this.translate_task = None;
+            if !translation_on {
+                // Switching translation off only hides the translated lanes until it is
+                // switched back on.
+                cx.notify();
+                return;
             }
-            match translation_on {
-                true => {
-                    // Picking a provider whose key is not saved yet must not attempt a
-                    // translation: the key field is still empty and Save has not been
-                    // pressed, so the attempt could only warn about the missing key.
-                    // The attempt runs once a key is saved, or right away for a
-                    // provider that needs none.
-                    let provider = settings.translation_provider();
-                    if !provider.needs_key()
-                        || music::lyrics::translate::has_translation_key(provider)
-                    {
-                        this.maybe_translate(cx);
-                    }
+            // Picking a provider whose key is not saved yet must not attempt a
+            // translation: the key field is still empty and Save has not been
+            // pressed, so the attempt could only warn about the missing key. The
+            // attempt runs once a key is saved, or right away for a provider that
+            // needs none.
+            let key_ready = !translation_provider.needs_key() || translation_has_key;
+            if provider_changed {
+                // A new provider translates the sheets again, but only when an
+                // attempt can actually run: clearing them for one that cannot
+                // would throw away translations nothing replaces yet.
+                if key_ready {
+                    this.clear_translations(cx);
+                    this.translate_failed_for = None;
+                    this.maybe_translate(cx);
                 }
-                false => cx.notify(),
+            } else if key_flipped {
+                // A key was just saved for this provider, so sheets held from
+                // another one are translated again with it.
+                this.clear_translations(cx);
+                this.translate_failed_for = None;
+                this.maybe_translate(cx);
+            } else if key_ready {
+                // Translation was switched on, or the custom server's address or
+                // model changed: the sheet on screen is translated if it has none
+                // yet, and what is already translated is left alone.
+                this.maybe_translate(cx);
             }
         })
         .detach();
@@ -143,8 +190,12 @@ impl Lyrics {
         let enabled_providers = settings.read(cx).lyrics_providers().to_vec();
         let priority = settings.read(cx).lyrics_provider_priority();
         let translation_enabled = settings.read(cx).lyrics_translation_enabled();
-        let translation_provider_name =
-            settings.read(cx).translation_provider().name().to_owned();
+        let translation_provider = settings.read(cx).translation_provider();
+        let translation_provider_name = translation_provider.name().to_owned();
+        let translation_has_key =
+            music::lyrics::translate::has_translation_key(translation_provider);
+        let translation_base_url = settings.read(cx).translation_base_url().to_owned();
+        let translation_model = settings.read(cx).translation_model().to_owned();
         let store = Sheets::new(storage::Cache::standard());
         let moving = store.clone();
         let migration = cx
@@ -175,9 +226,13 @@ impl Lyrics {
             ahead_of: None,
             save: None,
             translate_task: None,
+            translate_generation: 0,
             translate_failed_for: None,
             translation_enabled,
             translation_provider_name,
+            translation_has_key,
+            translation_base_url,
+            translation_model,
             _migration: migration,
         }
     }
@@ -242,6 +297,7 @@ impl Lyrics {
         self.picked = false;
         self.settled = false;
         self.translate_task = None;
+        self.translate_generation = self.translate_generation.wrapping_add(1);
         self.translate_failed_for = None;
         self.revision = self.revision.wrapping_add(1);
 
@@ -255,6 +311,10 @@ impl Lyrics {
                 .iter()
                 .all(|provider| found.covers(provider))
         {
+            // A lookup started ahead for this track must not show its answer after
+            // the remembered one is up and translate the sheet a second time.
+            self.ahead = None;
+            self.ahead_of = None;
             self.show(&found, &query, cx);
             return;
         }
@@ -380,6 +440,7 @@ impl Lyrics {
         }
         self.task = None;
         self.translate_task = None;
+        self.translate_generation = self.translate_generation.wrapping_add(1);
         self.translate_failed_for = None;
         self.following = None;
         self.hits.clear();
@@ -695,7 +756,9 @@ impl Lyrics {
     /// current sheet carries no translation yet. A translation that arrives is kept with
     /// the sheet, so the track is not translated again; a failed one is neither kept nor,
     /// unless the request never completed, tried again, and a failure is toasted about
-    /// once per track, naming the key only when the failure is about the key.
+    /// once per track, naming the key only when the failure is about the key. A run the
+    /// provider rate-limits waits out the asked-for wait and tries once more, and only
+    /// for the same track, sheet, and settings it started with.
     fn maybe_translate(&mut self, cx: &mut Context<Self>) {
         if self.translate_task.is_some() {
             return;
@@ -717,6 +780,12 @@ impl Lyrics {
             return;
         }
         let provider = settings.translation_provider();
+        // A provider whose key is not saved yet is never attempted: the attempt could
+        // only warn about the missing key, and the settings observer starts it once
+        // the key is saved.
+        if provider.needs_key() && !music::lyrics::translate::has_translation_key(provider) {
+            return;
+        }
         let provider_name = provider.name().to_owned();
         let needs_key = provider.needs_key();
         let toast_key = match &provider {
@@ -735,15 +804,23 @@ impl Lyrics {
         let io = self.io.clone();
         let http = self.http.clone();
         let lyrics = hit.lyrics.clone();
-        let outcome_request = request.clone();
+        let first_request = request.clone();
+        let first_lyrics = lyrics.clone();
+        let outcome_request = request;
+        self.translate_generation = self.translate_generation.wrapping_add(1);
+        let generation = self.translate_generation;
         self.translate_task = Some(cx.spawn(async move |this, cx| {
             // The request runs on the tokio runtime, the way the lyrics lookups
             // run theirs: hyper's DNS lookup panics with "there is no reactor
             // running" when polled on GPUI's executor, and that panic aborts the
             // whole process. A failure here only ever shows the original lyrics.
             let outcome = join(io.spawn(async move {
-                let outcome =
-                    music::lyrics::translate::translate_sheet(&lyrics, &request, &http).await;
+                let outcome = music::lyrics::translate::translate_sheet(
+                    &first_lyrics,
+                    &first_request,
+                    &http,
+                )
+                .await;
                 match outcome {
                     Ok(translated) => Ok(translated),
                     Err(error) => {
@@ -751,12 +828,16 @@ impl Lyrics {
                         // fresh connection: the endpoint may only have been
                         // unreachable for a moment. A rejected request or an
                         // unreadable answer would fail again, so those are not retried.
-                        if music::lyrics::translate::classify_error(&error, &request)
+                        if music::lyrics::translate::classify_error(&error, &first_request)
                             .is_retryable()
                         {
                             let http = music::lyrics::translate::translation_client();
-                            music::lyrics::translate::translate_sheet(&lyrics, &request, &http)
-                                .await
+                            music::lyrics::translate::translate_sheet(
+                                &first_lyrics,
+                                &first_request,
+                                &http,
+                            )
+                            .await
                         } else {
                             Err(error)
                         }
@@ -764,46 +845,259 @@ impl Lyrics {
                 }
             }))
             .await;
+            let retry = this.update(cx, |this, cx| {
+                this.finish_translation_attempt(
+                    outcome,
+                    &id,
+                    &hit,
+                    &lyrics,
+                    generation,
+                    &outcome_request,
+                    &provider_name,
+                    needs_key,
+                    toast_key,
+                    cx,
+                )
+            });
+            let Ok(Some(wait)) = retry else {
+                return;
+            };
+            // The wait runs on this outer task, so the sheet is re-checked on the
+            // entity's thread before the second request is spent.
+            cx.background_executor().timer(wait).await;
+            let attempt = this.update(cx, |this, cx| {
+                this.wake_delayed_retry(generation, &id, &lyrics, provider, cx)
+            });
+            let Ok(Some(request)) = attempt else {
+                return;
+            };
+            let kind_request = request.clone();
+            let retry_lyrics = lyrics.clone();
+            let outcome = join(io.spawn(async move {
+                let http = music::lyrics::translate::translation_client();
+                music::lyrics::translate::translate_sheet(&retry_lyrics, &request, &http).await
+            }))
+            .await;
             this.update(cx, |this, cx| {
-                if this.following.as_deref() != Some(id.as_str()) {
-                    return;
-                }
-                this.translate_task = None;
-                match outcome {
-                    Ok(translated) => this.keep_translation(id, hit, translated, cx),
-                    Err(error) => {
-                        // Only the failure's kind is logged: a provider error can name
-                        // the request it failed on, and a key must never reach the log.
-                        let kind = music::lyrics::translate::classify_error(
-                            &error,
-                            &outcome_request,
-                        );
-                        log::warn!(
-                            "lyrics: translation with {provider_name} failed: {}",
-                            kind.token()
-                        );
-                        let toasted = this.translate_failed_for.as_ref().is_some_and(|failed| {
-                            failed.0 == id && failed.1 == provider_name
-                        });
-                        if !toasted {
-                            // The key is blamed only when the failure is about the key;
-                            // anything else says the connection is the problem, so a
-                            // network failure never looks like a wrong key.
-                            let key = if needs_key && kind.is_key_error() {
-                                toast_key
-                            } else {
-                                Some("toast-translation-failed-network")
-                            };
-                            if let Some(key) = key {
-                                this.translate_failed_for = Some((id, provider_name.clone()));
-                                Toasts::show(Outcome::Failed, key, cx);
-                            }
-                        }
-                    }
-                }
+                this.finish_delayed_attempt(
+                    outcome,
+                    &id,
+                    &hit,
+                    &lyrics,
+                    generation,
+                    &kind_request,
+                    &provider_name,
+                    needs_key,
+                    toast_key,
+                    cx,
+                )
             })
             .ok();
         }));
+    }
+
+    /// Settles a first translation attempt on the entity's thread. A rate limit
+    /// schedules the one delayed retry and answers how long to wait, with no toast
+    /// yet; anything else is settled here and answers `None`. A run the world has
+    /// moved past is dropped, and the sheet on screen is handed a fresh attempt.
+    fn finish_translation_attempt(
+        &mut self,
+        outcome: anyhow::Result<music::Lyrics>,
+        id: &str,
+        hit: &LyricsHit,
+        lyrics: &music::Lyrics,
+        generation: u64,
+        request: &music::lyrics::translate::TranslateRequest,
+        provider_name: &str,
+        needs_key: bool,
+        toast_key: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Option<Duration> {
+        if let Some(reason) =
+            self.translation_skip_reason(generation, id, lyrics, request.provider, cx)
+        {
+            if reason != "superseded" {
+                self.translate_task = None;
+                log::debug!("lyrics: discarding a translation: {reason}");
+                self.maybe_translate(cx);
+            }
+            return None;
+        }
+        match outcome {
+            Ok(translated) => {
+                self.translate_task = None;
+                self.keep_translation(id.to_owned(), hit.clone(), translated, cx);
+                None
+            }
+            Err(error) => {
+                let kind = music::lyrics::translate::classify_error(&error, request);
+                if kind.is_rate_limited() {
+                    let wait = music::lyrics::translate::failure_delay(&error)
+                        .unwrap_or(TRANSLATE_RETRY_DELAY)
+                        .clamp(TRANSLATE_RETRY_MIN, TRANSLATE_RETRY_MAX);
+                    log::debug!("lyrics: rate-limited; retrying once in {}s", wait.as_secs());
+                    return Some(wait);
+                }
+                self.translate_task = None;
+                // Only the failure's kind is logged: a provider error can name
+                // the request it failed on, and a key must never reach the log.
+                log::warn!(
+                    "lyrics: translation with {provider_name} failed: {}",
+                    kind.token()
+                );
+                self.toast_translation_failure(id, provider_name, needs_key, toast_key, kind, cx);
+                None
+            }
+        }
+    }
+
+    /// Wakes a delayed retry: re-checks the track, sheet, and settings before the
+    /// second request is spent, and rebuilds the request from the settings now
+    /// held. Answers `None` when the retry is skipped, with the slot settled and
+    /// the sheet on screen handed a fresh attempt, or superseded, with the slot
+    /// left to the run that superseded it.
+    fn wake_delayed_retry(
+        &mut self,
+        generation: u64,
+        id: &str,
+        lyrics: &music::Lyrics,
+        provider: music::lyrics::translate::Provider,
+        cx: &mut Context<Self>,
+    ) -> Option<music::lyrics::translate::TranslateRequest> {
+        match self.translation_skip_reason(generation, id, lyrics, provider, cx) {
+            Some("superseded") => {
+                log::debug!("lyrics: skipping delayed translation retry: superseded");
+                None
+            }
+            Some(reason) => {
+                self.translate_task = None;
+                log::debug!("lyrics: skipping delayed translation retry: {reason}");
+                self.maybe_translate(cx);
+                None
+            }
+            None => {
+                let settings = self.settings.read(cx);
+                Some(music::lyrics::translate::TranslateRequest {
+                    provider: settings.translation_provider(),
+                    base_url: settings.translation_base_url().to_owned(),
+                    model: settings.translation_model().to_owned(),
+                })
+            }
+        }
+    }
+
+    /// Settles the delayed retry. It never schedules another: a second rate limit
+    /// is toasted about like any other failure.
+    fn finish_delayed_attempt(
+        &mut self,
+        outcome: anyhow::Result<music::Lyrics>,
+        id: &str,
+        hit: &LyricsHit,
+        lyrics: &music::Lyrics,
+        generation: u64,
+        request: &music::lyrics::translate::TranslateRequest,
+        provider_name: &str,
+        needs_key: bool,
+        toast_key: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) =
+            self.translation_skip_reason(generation, id, lyrics, request.provider, cx)
+        {
+            if reason != "superseded" {
+                self.translate_task = None;
+                log::debug!("lyrics: discarding a retried translation: {reason}");
+                self.maybe_translate(cx);
+            }
+            return;
+        }
+        self.translate_task = None;
+        match outcome {
+            Ok(translated) => {
+                self.keep_translation(id.to_owned(), hit.clone(), translated, cx)
+            }
+            Err(error) => {
+                // Only the failure's kind is logged: a provider error can name
+                // the request it failed on, and a key must never reach the log.
+                let kind = music::lyrics::translate::classify_error(&error, request);
+                log::warn!(
+                    "lyrics: translation with {provider_name} failed: {}",
+                    kind.token()
+                );
+                self.toast_translation_failure(id, provider_name, needs_key, toast_key, kind, cx);
+            }
+        }
+    }
+
+    /// Why a translation run no longer speaks for the sheet on screen, if it does
+    /// not: superseded by a newer run, or the track, sheet, provider, or settings
+    /// moved while it ran. `None` means the run still speaks for it.
+    fn translation_skip_reason(
+        &self,
+        generation: u64,
+        id: &str,
+        lyrics: &music::Lyrics,
+        provider: music::lyrics::translate::Provider,
+        cx: &Context<Self>,
+    ) -> Option<&'static str> {
+        if self.translate_generation != generation {
+            return Some("superseded");
+        }
+        if self.following.as_deref() != Some(id) {
+            return Some("track-changed");
+        }
+        let Some(current) = self.current() else {
+            return Some("sheet-changed");
+        };
+        if &current.lyrics != lyrics {
+            return Some("sheet-changed");
+        }
+        if translated(&current.lyrics) {
+            return Some("already-translated");
+        }
+        let settings = self.settings.read(cx);
+        if settings.translation_provider() != provider {
+            return Some("provider-changed");
+        }
+        if !settings.lyrics_translation_enabled() {
+            return Some("disabled");
+        }
+        if provider.needs_key() && !music::lyrics::translate::has_translation_key(provider) {
+            return Some("no-key");
+        }
+        None
+    }
+
+    /// Toasts about a translation failure once per track and provider, naming the
+    /// key only when the failure is about the key, the model when the provider
+    /// says the model is not there, and the connection for anything else, so a
+    /// network failure never looks like a wrong key.
+    fn toast_translation_failure(
+        &mut self,
+        id: &str,
+        provider_name: &str,
+        needs_key: bool,
+        toast_key: Option<&'static str>,
+        kind: music::lyrics::translate::FailureKind,
+        cx: &mut Context<Self>,
+    ) {
+        let toasted = self.translate_failed_for.as_ref().is_some_and(|failed| {
+            failed.0 == id && failed.1 == provider_name
+        });
+        if toasted {
+            return;
+        }
+        let key = if kind == music::lyrics::translate::FailureKind::Status(404) {
+            Some("toast-translation-failed-model")
+        } else if needs_key && kind.is_key_error() {
+            toast_key
+        } else {
+            Some("toast-translation-failed-network")
+        };
+        if let Some(key) = key {
+            self.translate_failed_for = Some((id.to_owned(), provider_name.to_owned()));
+            Toasts::show(Outcome::Failed, key, cx);
+        }
     }
 
     /// Keeps a translated sheet where the untranslated one was: on screen, in the answers
@@ -852,7 +1146,7 @@ impl Lyrics {
     /// Drops every translation held in memory, so the sheets are translated again with
     /// the provider now chosen. Sheets already saved in the cache database keep the old
     /// provider's translations until the track is translated again.
-    fn clear_translations(&mut self) {
+    fn clear_translations(&mut self, cx: &mut Context<Self>) {
         for hit in &mut self.hits {
             drop_translations(&mut hit.lyrics);
         }
@@ -861,6 +1155,8 @@ impl Lyrics {
                 drop_translations(&mut hit.lyrics);
             }
         }
+        self.revision = self.revision.wrapping_add(1);
+        cx.notify();
     }
 
     /// Writes the unsaved answers once lookups have gone quiet for `SAVE_DELAY`. A write that

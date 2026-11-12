@@ -148,6 +148,8 @@ pub(crate) struct VerseLook {
     pub(crate) lane: Pixels,
     pub(crate) karaoke: bool,
     pub(crate) scripts: Option<RomanizationScripts>,
+    /// Whether the verse shows its Persian translation under the line.
+    pub(crate) translation: bool,
     /// How far out of focus the verse sits, from 0 for sharp to 1 at the sheet's edge.
     pub(crate) haze: f32,
 }
@@ -181,6 +183,7 @@ struct SheetLayout {
     verse: Pixels,
     lane: Pixels,
     scripts: Option<RomanizationScripts>,
+    translation: bool,
     rem: Pixels,
     scale: f32,
     font: u64,
@@ -234,6 +237,10 @@ pub(crate) struct Aside {
     lyrics_wrap_width: Option<Pixels>,
     lyrics_wrap_size: Option<Pixels>,
     lyrics_wraps: HashMap<usize, Wrapped>,
+    /// Wrapped rows of each line's Persian translation, kept with the text they were wrapped
+    /// from, since a translation can land after the sheet is up and must never read another
+    /// text's rows.
+    translation_wraps: HashMap<usize, (String, Wrapped)>,
     lane_rooms: HashMap<usize, Pixels>,
     seen: Pixels,
     flying: bool,
@@ -338,6 +345,7 @@ impl Aside {
             lyrics_wrap_width: None,
             lyrics_wrap_size: None,
             lyrics_wraps: HashMap::new(),
+            translation_wraps: HashMap::new(),
             lane_rooms: HashMap::new(),
             seen: px(0.),
             flying: false,
@@ -511,6 +519,7 @@ impl Aside {
 
     fn forget_measurements(&mut self) {
         self.lyrics_wraps.clear();
+        self.translation_wraps.clear();
         self.lane_rooms.clear();
         self.drifts.clear();
         self.sheet_layout = None;
@@ -1007,13 +1016,14 @@ impl Aside {
         let following = (self.verse_of.as_deref() != lyrics.following())
             .then(|| lyrics.following().map(str::to_owned));
         let take = lyrics.revision();
-        let (karaoke_lyrics, romanization_scripts) = {
+        let (karaoke_lyrics, romanization_scripts, show_translation) = {
             let settings = self.settings.read(cx);
             (
                 settings.karaoke_lyrics(),
                 settings
                     .romanized_lyrics()
                     .then(|| settings.romanization_scripts()),
+                settings.lyrics_translation_enabled(),
             )
         };
         let karaoke_effects = karaoke_lyrics && effects();
@@ -1113,6 +1123,7 @@ impl Aside {
             verse,
             lane: lane_size,
             scripts: romanization_scripts,
+            translation: show_translation,
             rem: window.rem_size(),
             scale: window.scale_factor(),
             font: font_key(self.settings.read(cx).font()),
@@ -1272,6 +1283,30 @@ impl Aside {
                             slot.insert(wrapped);
                         }
                     }
+                    // A Persian translation wraps here too, for the same reason a lane does:
+                    // gpui wraps by assuming each glyph sits right of the one before it.
+                    let translation_text = show_translation
+                        .then(|| line.translated.as_deref())
+                        .flatten()
+                        .filter(|text| has_right_to_left(text));
+                    if let Some(text) = translation_text {
+                        let fresh = self
+                            .translation_wraps
+                            .get(&index)
+                            .is_some_and(|(from, _)| from.as_str() == text);
+                        if !fresh {
+                            let parts = lyrics_parts(text, None);
+                            match lyrics_wrap_rows(&parts, lane_size, wrap_width, window) {
+                                Some(wrapped) => {
+                                    self.translation_wraps
+                                        .insert(index, (text.to_owned(), wrapped));
+                                }
+                                None => {
+                                    self.translation_wraps.remove(&index);
+                                }
+                            }
+                        }
+                    }
                     // A settled row far off screen is only a spacer of the height it had last frame,
                     // which is the height it would have now.
                     let settled =
@@ -1295,6 +1330,9 @@ impl Aside {
                         continue;
                     }
                     let wrapped = self.lyrics_wraps.get(&index);
+                    let translation_rows = translation_text
+                        .and_then(|_| self.translation_wraps.get(&index))
+                        .map(|(_, wrapped)| wrapped.text.as_slice());
                     let line_has_ended = active_line.is_some_and(|active| index < active)
                         || line_has_passed(line, position);
                     let worded = karaoke_effects && line.worded() && line.words.is_some();
@@ -1448,6 +1486,17 @@ impl Aside {
                             selected_romanization(&line.romanized, romanization_scripts),
                             |this, text| this.child(romanized_lyrics_lane(text, lane_size, &theme)),
                         )
+                        .when_some(
+                            selected_translation(&line.translated, show_translation),
+                            |this, text| {
+                                this.child(translation_lyrics_lane(
+                                    text,
+                                    translation_rows,
+                                    lane_size,
+                                    &theme,
+                                ))
+                            },
+                        )
                         .children(lanes)
                         .when(depth > 0., |this| {
                             this.layer_scale(1. - (1. - PRESSED) * depth)
@@ -1464,9 +1513,11 @@ impl Aside {
                     let traded = index
                         .checked_sub(1)
                         .is_some_and(|previous| lines[previous].voice != line.voice);
-                    // the romanization and the backing vocals under a line are read after it
+                    // the romanization, the translation and the backing vocals under a line
+                    // are read after it
                     let lanes_spoken = selected_romanization(&line.romanized, romanization_scripts)
                         .into_iter()
+                        .chain(selected_translation(&line.translated, show_translation))
                         .chain(line.secondary.iter().map(|lane| lane.text.clone()))
                         .filter(|text| !text.is_empty())
                         .collect::<Vec<_>>()
@@ -1526,9 +1577,13 @@ impl Aside {
             }
             (None, LyricsState::Ready) => {
                 match self.lyrics.read(cx).current().map(|hit| &hit.lyrics) {
-                    Some(music::Lyrics::Plain { text, romanized }) => {
+                    Some(music::Lyrics::Plain { text, romanized, translated }) => {
                         let romanized = selected_romanization(romanized, romanization_scripts);
                         let romanized_lines = romanized
+                            .as_deref()
+                            .map_or_else(Vec::new, |text| text.lines().collect::<Vec<_>>());
+                        let translated = selected_translation(translated, show_translation);
+                        let translated_lines = translated
                             .as_deref()
                             .map_or_else(Vec::new, |text| text.lines().collect::<Vec<_>>());
                         let plain_size = (lane_size * PLAIN_LYRICS_GROWTH).round();
@@ -1551,6 +1606,26 @@ impl Aside {
                                 })
                                 .collect::<Vec<_>>()
                         });
+                        // Each Persian translation line wraps the same way, at the lane size.
+                        let translated_rows = translated.as_deref().map(|text| {
+                            text.lines()
+                                .map(|line| {
+                                    has_right_to_left(line)
+                                        .then(|| {
+                                            lyrics_wrap_rows(
+                                                &lyrics_parts(line, None),
+                                                lane_size,
+                                                wrap_width,
+                                                window,
+                                            )
+                                        })
+                                        .flatten()
+                                        .filter(|plan| !plan.text.is_empty())
+                                        .map(|plan| plan.text)
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        let has_lanes = romanized.is_some() || translated.is_some();
                         vec![
                             div()
                                 .id("plain-lyrics")
@@ -1565,7 +1640,7 @@ impl Aside {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.foreground)
                                 .when(sung.mirrored, |this| this.text_right())
-                                .map(|this| match (&rows, romanized.is_some()) {
+                                .map(|this| match (&rows, has_lanes) {
                                     (None, false) => this.child(SharedString::from(text.clone())),
                                     _ => this.children(text.lines().enumerate().map(
                                         |(index, line)| {
@@ -1579,19 +1654,37 @@ impl Aside {
                                                     div().child(SharedString::from(line.to_owned()))
                                                 }
                                             };
-                                            div().flex().flex_col().child(spoken).when_some(
-                                                romanized_lines
+                                            let with_romanized =
+                                                div().flex().flex_col().child(spoken).when_some(
+                                                    romanized_lines
+                                                        .get(index)
+                                                        .filter(|line| !line.is_empty()),
+                                                    |this, line| {
+                                                        this.child(
+                                                            romanized_lyrics_lane(
+                                                                (*line).to_owned(),
+                                                                lane_size,
+                                                                &theme,
+                                                            )
+                                                            .font_weight(FontWeight::NORMAL),
+                                                        )
+                                                    },
+                                                );
+                                            with_romanized.when_some(
+                                                translated_lines
                                                     .get(index)
                                                     .filter(|line| !line.is_empty()),
                                                 |this, line| {
-                                                    this.child(
-                                                        romanized_lyrics_lane(
-                                                            (*line).to_owned(),
-                                                            lane_size,
-                                                            &theme,
-                                                        )
-                                                        .font_weight(FontWeight::NORMAL),
-                                                    )
+                                                    let rows = translated_rows
+                                                        .as_ref()
+                                                        .and_then(|rows| rows.get(index))
+                                                        .and_then(Option::as_deref);
+                                                    this.child(translation_lyrics_lane(
+                                                        (*line).to_owned(),
+                                                        rows,
+                                                        lane_size,
+                                                        &theme,
+                                                    ))
                                                 },
                                             )
                                         },
@@ -2133,7 +2226,8 @@ fn fixed_lyrics_lane(rows: &[SharedString], voice: Voice, sung: Sung) -> Div {
 }
 
 /// One verse drawn the way the sheet draws it at rest, with its karaoke sweep at `position` and
-/// its romanized lane, but without the sheet's pointer handling, drift or growth animations.
+/// its romanized and translation lanes, but without the sheet's pointer handling, drift or
+/// growth animations.
 pub(crate) fn verse(
     line: &music::LyricsLine,
     look: VerseLook,
@@ -2217,6 +2311,12 @@ pub(crate) fn verse(
                 .when_some(
                     selected_romanization(&line.romanized, look.scripts),
                     |this, text| this.child(romanized_lyrics_lane(text, look.lane, &theme)),
+                )
+                .when_some(
+                    selected_translation(&line.translated, look.translation),
+                    |this, text| {
+                        this.child(translation_lyrics_lane(text, None, look.lane, &theme))
+                    },
                 ),
         )
         .when(haze > 0., |this| this.opacity(1. - VEIL * haze))
@@ -2531,6 +2631,11 @@ fn selected_romanization(
         .then(|| romanized.text.clone())
 }
 
+fn selected_translation(translated: &Option<String>, show: bool) -> Option<String> {
+    let translated = translated.as_ref()?;
+    show.then(|| translated.clone())
+}
+
 /// Which source a sheet came from and, when it names them, who wrote the song.
 fn credit_lines(source: &str, writers: &[String]) -> (SharedString, Option<SharedString>) {
     let from = match source == music::lyrics::LOCAL {
@@ -2556,6 +2661,33 @@ fn romanized_lyrics_lane(text: String, size: Pixels, theme: &ui::Theme) -> Div {
         .text_size(size)
         .text_color(quiet(theme))
         .child(SharedString::from(text))
+}
+
+/// A Persian translation under a line, set like the romanized lane but in the regular weight.
+/// The translation reads right to left, so rows `lyrics_wrap_rows` already broke are laid out
+/// one line each and never wrap again, and a line without rows sits against the right edge.
+fn translation_lyrics_lane(
+    text: String,
+    rows: Option<&[SharedString]>,
+    size: Pixels,
+    theme: &ui::Theme,
+) -> Div {
+    let lane = div()
+        .text_size(size)
+        .text_color(quiet(theme))
+        .font_weight(FontWeight::NORMAL);
+    match rows {
+        Some(rows) => lane.flex().flex_col().children(rows.iter().map(|row| {
+            div()
+                .w_full()
+                .whitespace_nowrap()
+                .text_right()
+                .child(row.clone())
+        })),
+        None => lane
+            .when(has_right_to_left(&text), |this| this.text_right())
+            .child(SharedString::from(text)),
+    }
 }
 
 fn karaoke_window(

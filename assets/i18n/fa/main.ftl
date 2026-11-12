@@ -1088,6 +1088,7 @@ settings-translation-no-key-needed = Google Translate به کلید نیاز ن�
 toast-translation-failed-gemini = ترجمهٔ متن آهنگ با Gemini ناموفق بود. کلید را در تنظیمات بررسی کنید.
 toast-translation-failed-openai = ترجمهٔ متن آهنگ با OpenAI ناموفق بود. کلید را در تنظیمات بررسی کنید.
 toast-translation-failed-openai-compatible = ترجمهٔ متن آهنگ با سرویس دلخواه ناموفق بود. کلید و نشانی سرور را در تنظیمات بررسی کنید.
+toast-translation-failed-network = ترجمهٔ متن آهنگ ناموفق بود. اتصال اینترنت را بررسی کنید.
 settings-group-window = پنجره
 settings-group-text = متن
 settings-group-motion = حرکت

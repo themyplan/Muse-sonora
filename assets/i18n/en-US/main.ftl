@@ -1082,6 +1082,7 @@ settings-translation-no-key-needed = Google Translate needs no key
 toast-translation-failed-gemini = Lyrics translation with Gemini failed. Check the key in Settings.
 toast-translation-failed-openai = Lyrics translation with OpenAI failed. Check the key in Settings.
 toast-translation-failed-openai-compatible = Lyrics translation with the custom provider failed. Check the key and server address in Settings.
+toast-translation-failed-network = Lyrics translation failed. Check your internet connection.
 settings-group-window = Window
 settings-group-text = Text
 settings-group-motion = Motion

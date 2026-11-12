@@ -122,7 +122,19 @@ impl Lyrics {
                 this.translate_failed_for = None;
             }
             match translation_on {
-                true => this.maybe_translate(cx),
+                true => {
+                    // Picking a provider whose key is not saved yet must not attempt a
+                    // translation: the key field is still empty and Save has not been
+                    // pressed, so the attempt could only warn about the missing key.
+                    // The attempt runs once a key is saved, or right away for a
+                    // provider that needs none.
+                    let provider = settings.translation_provider();
+                    if !provider.needs_key()
+                        || music::lyrics::translate::has_translation_key(provider)
+                    {
+                        this.maybe_translate(cx);
+                    }
+                }
                 false => cx.notify(),
             }
         })
@@ -157,7 +169,7 @@ impl Lyrics {
             session,
             settings,
             io,
-            http: reqwest::Client::new(),
+            http: music::lyrics::translate::translation_client(),
             task: None,
             ahead: None,
             ahead_of: None,
@@ -681,8 +693,9 @@ impl Lyrics {
 
     /// Translates the lyrics on screen, once per track, when translation is on and the
     /// current sheet carries no translation yet. A translation that arrives is kept with
-    /// the sheet, so the track is not translated again; a failed one is neither kept nor
-    /// retried, and a provider whose key is wrong is toasted about once per track.
+    /// the sheet, so the track is not translated again; a failed one is neither kept nor,
+    /// unless the request never completed, tried again, and a failure is toasted about
+    /// once per track, naming the key only when the failure is about the key.
     fn maybe_translate(&mut self, cx: &mut Context<Self>) {
         if self.translate_task.is_some() {
             return;
@@ -722,13 +735,33 @@ impl Lyrics {
         let io = self.io.clone();
         let http = self.http.clone();
         let lyrics = hit.lyrics.clone();
+        let outcome_request = request.clone();
         self.translate_task = Some(cx.spawn(async move |this, cx| {
             // The request runs on the tokio runtime, the way the lyrics lookups
             // run theirs: hyper's DNS lookup panics with "there is no reactor
             // running" when polled on GPUI's executor, and that panic aborts the
             // whole process. A failure here only ever shows the original lyrics.
             let outcome = join(io.spawn(async move {
-                music::lyrics::translate::translate_sheet(&lyrics, &request, &http).await
+                let outcome =
+                    music::lyrics::translate::translate_sheet(&lyrics, &request, &http).await;
+                match outcome {
+                    Ok(translated) => Ok(translated),
+                    Err(error) => {
+                        // A request that never completed is worth one more try, on a
+                        // fresh connection: the endpoint may only have been
+                        // unreachable for a moment. A rejected request or an
+                        // unreadable answer would fail again, so those are not retried.
+                        if music::lyrics::translate::classify_error(&error, &request)
+                            .is_retryable()
+                        {
+                            let http = music::lyrics::translate::translation_client();
+                            music::lyrics::translate::translate_sheet(&lyrics, &request, &http)
+                                .await
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
             }))
             .await;
             this.update(cx, |this, cx| {
@@ -738,15 +771,30 @@ impl Lyrics {
                 this.translate_task = None;
                 match outcome {
                     Ok(translated) => this.keep_translation(id, hit, translated, cx),
-                    Err(_) => {
-                        // The error is left out on purpose: a provider error can name the
-                        // request it failed on, and a key must never reach the log.
-                        log::warn!("lyrics: translation with {provider_name} failed");
+                    Err(error) => {
+                        // Only the failure's kind is logged: a provider error can name
+                        // the request it failed on, and a key must never reach the log.
+                        let kind = music::lyrics::translate::classify_error(
+                            &error,
+                            &outcome_request,
+                        );
+                        log::warn!(
+                            "lyrics: translation with {provider_name} failed: {}",
+                            kind.token()
+                        );
                         let toasted = this.translate_failed_for.as_ref().is_some_and(|failed| {
                             failed.0 == id && failed.1 == provider_name
                         });
-                        if needs_key && !toasted {
-                            if let Some(key) = toast_key {
+                        if !toasted {
+                            // The key is blamed only when the failure is about the key;
+                            // anything else says the connection is the problem, so a
+                            // network failure never looks like a wrong key.
+                            let key = if needs_key && kind.is_key_error() {
+                                toast_key
+                            } else {
+                                Some("toast-translation-failed-network")
+                            };
+                            if let Some(key) = key {
                                 this.translate_failed_for = Some((id, provider_name.clone()));
                                 Toasts::show(Outcome::Failed, key, cx);
                             }

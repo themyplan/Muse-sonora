@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,150 @@ pub struct TranslateRequest {
     pub provider: Provider,
     pub base_url: String,
     pub model: String,
+}
+
+/// Why a translation run failed, classified so it is safe to log and to act on: a kind
+/// never carries a URL, a key, or lyrics text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The request never reached the provider: DNS or TCP connect failed.
+    Connect,
+    /// The request timed out.
+    Timeout,
+    /// The provider answered with an HTTP error status.
+    Status(u16),
+    /// The response body could not be read.
+    Decode,
+    /// The provider needs a key and none is saved.
+    NoKey,
+    /// The OpenAI-compatible provider needs a base URL in Settings.
+    NoBaseUrl,
+    /// The OpenAI-compatible provider needs a model name in Settings.
+    NoModel,
+    /// The AI provider answered in a shape the code does not understand.
+    UnexpectedShape,
+    /// The Google endpoint answered, but no chunk could be read back.
+    GoogleUnparseable,
+    /// The translation task was cancelled or panicked.
+    Cancelled,
+    /// The failure could not be classified.
+    Unknown,
+}
+
+impl FailureKind {
+    /// The one token written to the log for this kind.
+    pub fn token(self) -> String {
+        match self {
+            Self::Connect => "connect".to_owned(),
+            Self::Timeout => "timeout".to_owned(),
+            Self::Status(status) => format!("http-{status}"),
+            Self::Decode => "decode".to_owned(),
+            Self::NoKey => "no-key".to_owned(),
+            Self::NoBaseUrl => "no-base-url".to_owned(),
+            Self::NoModel => "no-model".to_owned(),
+            Self::UnexpectedShape => "unexpected-shape".to_owned(),
+            Self::GoogleUnparseable => "google-unparseable".to_owned(),
+            Self::Cancelled => "cancelled".to_owned(),
+            Self::Unknown => "unknown".to_owned(),
+        }
+    }
+
+    /// Whether the failure is about the key: no key saved, or the provider rejected
+    /// the request as unauthorized. Only these deserve the "check the key" message.
+    pub fn is_key_error(self) -> bool {
+        matches!(self, Self::NoKey | Self::Status(401) | Self::Status(403))
+    }
+
+    /// Whether the run is worth trying once more: only failures where the request
+    /// never completed. A rejected request or an unreadable answer would fail again.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Connect | Self::Timeout)
+    }
+
+    /// Classifies an error by what it carries: a kind attached by the translation
+    /// code itself, a cancelled task, or a request error, whose flags and status code
+    /// alone are read. The error's message is never read: it can name the request
+    /// URL, which can carry the key. `None` means the error carries none of these,
+    /// and the request itself must say why it failed.
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        if let Some(kinded) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<KindedError>())
+        {
+            return Some(kinded.0);
+        }
+        if error
+            .chain()
+            .any(|cause| cause.downcast_ref::<tokio::task::JoinError>().is_some())
+        {
+            return Some(Self::Cancelled);
+        }
+        let request = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())?;
+        Some(if let Some(status) = request.status() {
+            Self::Status(status.as_u16())
+        } else if request.is_timeout() {
+            Self::Timeout
+        } else if request.is_connect() {
+            Self::Connect
+        } else if request.is_decode() {
+            Self::Decode
+        } else {
+            Self::Unknown
+        })
+    }
+}
+
+/// An error that carries only a [`FailureKind`], so the reason a run failed survives
+/// to the caller without ever naming a URL, a key, or lyrics text.
+#[derive(Debug)]
+pub struct KindedError(FailureKind);
+
+impl std::fmt::Display for KindedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "translation failed: {}", self.0.token())
+    }
+}
+
+impl std::error::Error for KindedError {}
+
+/// Classifies why a translation run failed, for the log line, the message shown, and
+/// whether to try again. The error itself is asked first; when it carries no request
+/// at all, the request says why, because a missing key, base URL, or model fails
+/// before any HTTP, and anything else that far along is an answer the code could
+/// not read.
+pub fn classify_error(error: &anyhow::Error, request: &TranslateRequest) -> FailureKind {
+    if let Some(kind) = FailureKind::from_error(error) {
+        return kind;
+    }
+    if request.provider == Provider::OpenAiCompatible {
+        if request.base_url.trim().is_empty() {
+            return FailureKind::NoBaseUrl;
+        }
+        if request.model.trim().is_empty() {
+            return FailureKind::NoModel;
+        }
+    }
+    if request.provider.needs_key() && !has_translation_key(request.provider) {
+        return FailureKind::NoKey;
+    }
+    match request.provider {
+        Provider::Google => FailureKind::GoogleUnparseable,
+        _ => FailureKind::UnexpectedShape,
+    }
+}
+
+/// A client for one translation run: fresh, so no pooled connection from an earlier
+/// run is reused, with bounded waits, so a failure surfaces in seconds instead of
+/// hanging on the operating system's own timeouts.
+pub fn translation_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// The language every translation targets.
@@ -240,6 +385,7 @@ async fn translate_google(
     http: &reqwest::Client,
 ) -> anyhow::Result<Vec<Option<String>>> {
     let mut translated = Vec::with_capacity(wanted.len());
+    let mut first_failure: Option<FailureKind> = None;
     for chunk in chunk_lines(wanted) {
         let joined = chunk.join("\n");
         match google_answer(http, &joined).await {
@@ -253,15 +399,22 @@ async fn translate_google(
                     }
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 // The endpoint itself failed, so retrying line by line would only repeat
-                // the failure. The chunk stays untranslated.
+                // the failure. The chunk stays untranslated, and the first failure's
+                // kind is kept so the caller can say why the run failed.
+                let kind = FailureKind::from_error(&error).unwrap_or(FailureKind::Unknown);
+                log::debug!("lyrics: google chunk failed: {}", kind.token());
+                if first_failure.is_none() {
+                    first_failure = Some(kind);
+                }
                 translated.extend(std::iter::repeat_n(None, chunk.len()));
             }
         }
     }
     if !translated.is_empty() && translated.iter().all(Option::is_none) {
-        anyhow::bail!("Google Translate could not translate the lyrics");
+        let kind = first_failure.unwrap_or(FailureKind::GoogleUnparseable);
+        return Err(anyhow::Error::new(KindedError(kind)));
     }
     Ok(translated)
 }
@@ -578,6 +731,55 @@ mod tests {
         assert_eq!(Provider::OpenAiCompatible.name(), "OpenAI-compatible");
         assert!(Provider::OpenAiCompatible.needs_key());
         assert_eq!(Provider::default(), Provider::Google);
+    }
+
+    #[test]
+    fn failure_kinds_log_a_single_token() {
+        assert_eq!(FailureKind::Connect.token(), "connect");
+        assert_eq!(FailureKind::Timeout.token(), "timeout");
+        assert_eq!(FailureKind::Status(403).token(), "http-403");
+        assert_eq!(FailureKind::Decode.token(), "decode");
+        assert_eq!(FailureKind::NoKey.token(), "no-key");
+        assert_eq!(FailureKind::NoBaseUrl.token(), "no-base-url");
+        assert_eq!(FailureKind::NoModel.token(), "no-model");
+        assert_eq!(FailureKind::UnexpectedShape.token(), "unexpected-shape");
+        assert_eq!(
+            FailureKind::GoogleUnparseable.token(),
+            "google-unparseable"
+        );
+        assert_eq!(FailureKind::Cancelled.token(), "cancelled");
+        assert_eq!(FailureKind::Unknown.token(), "unknown");
+    }
+
+    #[test]
+    fn only_key_failures_blame_the_key() {
+        assert!(FailureKind::NoKey.is_key_error());
+        assert!(FailureKind::Status(401).is_key_error());
+        assert!(FailureKind::Status(403).is_key_error());
+        assert!(!FailureKind::Status(404).is_key_error());
+        assert!(!FailureKind::Status(429).is_key_error());
+        assert!(!FailureKind::Connect.is_key_error());
+        assert!(!FailureKind::Timeout.is_key_error());
+        assert!(!FailureKind::GoogleUnparseable.is_key_error());
+    }
+
+    #[test]
+    fn only_unfinished_requests_are_retried() {
+        assert!(FailureKind::Connect.is_retryable());
+        assert!(FailureKind::Timeout.is_retryable());
+        assert!(!FailureKind::Status(403).is_retryable());
+        assert!(!FailureKind::Status(429).is_retryable());
+        assert!(!FailureKind::NoKey.is_retryable());
+        assert!(!FailureKind::UnexpectedShape.is_retryable());
+    }
+
+    #[test]
+    fn a_classified_failure_survives_the_error_chain() {
+        let error = anyhow::Error::new(KindedError(FailureKind::Connect));
+        assert_eq!(
+            classify_error(&error, &TranslateRequest::default()),
+            FailureKind::Connect
+        );
     }
 
     #[test]

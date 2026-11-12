@@ -7,7 +7,7 @@ use i18n::t;
 use music::WritingSystem;
 use music::lyrics::translate::Provider;
 use router::{Destination, SettingsPage, navigate};
-use state::{AppSettings, LYRICS_SOURCES};
+use state::{AppSettings, LYRICS_SOURCES, Outcome, Toasts};
 use ui::{
     ActiveTheme as _, Button, Ghost, MAX_LYRICS_SCALE, MIN_LYRICS_SCALE, MenuItem, Picker, Switch,
     drop_gap, drop_marker, grip, tabular,
@@ -489,6 +489,10 @@ impl SettingsView {
                     this.settings.update(cx, |settings, cx| {
                         settings.set_translation_provider(variant, cx);
                     });
+                    // A key typed for one provider must not survive the switch and
+                    // be saved under the next one.
+                    this.translation_key
+                        .update(cx, |input, cx| input.set_text("", cx));
                     cx.notify();
                 }))
         }));
@@ -547,7 +551,9 @@ impl SettingsView {
 
     /// The Save button, standing on its own at the row's end. It keeps a typed key, and the
     /// custom server's address and model while that provider is picked, then clears the key
-    /// field so the key never lingers on screen. It stands held while the provider needs a
+    /// field when the key is kept, so the key never lingers on screen. A key that could not
+    /// be kept stays in the field, and the failure is toasted about; an emptied address or
+    /// model field keeps what was saved before. It stands held while the provider needs a
     /// key, nothing is typed, and none is saved yet, so a first press cannot silently keep
     /// nothing.
     pub(super) fn translation_save_row(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -574,20 +580,39 @@ impl SettingsView {
                         let provider = this.settings.read(cx).translation_provider();
                         let custom = provider == Provider::OpenAiCompatible;
                         let key = this.translation_key.read(cx).text().trim().to_owned();
+                        let mut saved = true;
                         if !key.is_empty() {
-                            this.settings.update(cx, |settings, cx| {
-                                settings.save_translation_key(provider, key, cx);
+                            let outcome = this.settings.update(cx, |settings, cx| {
+                                settings.save_translation_key(provider, key, cx)
                             });
+                            if outcome.is_err() {
+                                saved = false;
+                                Toasts::show(
+                                    Outcome::Failed,
+                                    "toast-translation-key-save-failed",
+                                    cx,
+                                );
+                            }
                         }
                         if custom {
-                            let base_url = this.translation_base_url.read(cx).text().to_owned();
-                            let model = this.translation_model.read(cx).text().to_owned();
+                            let base_url =
+                                this.translation_base_url.read(cx).text().trim().to_owned();
+                            let model =
+                                this.translation_model.read(cx).text().trim().to_owned();
                             this.settings.update(cx, |settings, cx| {
-                                settings.set_translation_base_url(base_url, cx);
-                                settings.set_translation_model(model, cx);
+                                // An emptied field keeps what was saved before, the
+                                // way an empty key keeps the key already saved.
+                                if !base_url.is_empty() {
+                                    settings.set_translation_base_url(base_url, cx);
+                                }
+                                if !model.is_empty() {
+                                    settings.set_translation_model(model, cx);
+                                }
                             });
                         }
-                        this.translation_key.update(cx, |input, cx| input.set_text("", cx));
+                        if saved {
+                            this.translation_key.update(cx, |input, cx| input.set_text("", cx));
+                        }
                         cx.notify();
                     })),
             )

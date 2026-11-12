@@ -220,6 +220,7 @@ fn verse(verse: &Verse) -> Option<LyricsLine> {
         end: stamp(&verse.end).filter(|end| *end > start),
         text: text.to_owned(),
         romanized: None,
+        translated: None,
         words: (!words.is_empty()).then_some(words),
         secondary: Vec::new(),
         voice: Voice::Lead,

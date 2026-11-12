@@ -332,6 +332,7 @@ fn read(line: &str) -> Option<LyricsLine> {
         words: (!words.is_empty()).then_some(words),
         text,
         romanized: None,
+        translated: None,
         secondary: Vec::new(),
         voice: Voice::Lead,
     })

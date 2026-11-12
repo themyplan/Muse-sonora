@@ -8,7 +8,7 @@ use music::{LyricsHit, LyricsProvider, LyricsQuery, Track, TrackKey};
 use tokio::task::JoinSet;
 
 use crate::sheets::{Sheets, Unsaved};
-use crate::{AppSettings, Io, Playback, Queue, QueuePosition, Session, join};
+use crate::{AppSettings, Io, Outcome, Playback, Queue, QueuePosition, Session, Toasts, join};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LyricsState {
@@ -50,10 +50,20 @@ pub struct Lyrics {
     session: Entity<Session>,
     settings: Entity<AppSettings>,
     io: Io,
+    http: reqwest::Client,
     task: Option<Task<()>>,
     ahead: Option<Task<()>>,
     ahead_of: Option<String>,
     save: Option<Task<()>>,
+    translate_task: Option<Task<()>>,
+    /// The track and provider a translation failure was already toasted for, so a failure
+    /// is reported once per track until the provider changes or another track plays.
+    translate_failed_for: Option<(String, String)>,
+    /// Whether translation is on, as the settings last said. Kept so a change to the
+    /// translation settings alone does not look the track up again.
+    translation_enabled: bool,
+    /// The name of the translation provider, as the settings last said.
+    translation_provider_name: String,
     /// Moves the old lyrics.json into the cache database, once.
     _migration: Task<()>,
 }
@@ -79,23 +89,50 @@ impl Lyrics {
             let on = settings.lyrics_enabled();
             let enabled = settings.lyrics_providers();
             let priority = settings.lyrics_provider_priority();
-            if on == this.enabled && enabled == this.enabled_providers && priority == this.priority
-            {
+            let translation_on = settings.lyrics_translation_enabled();
+            let translation_provider = settings.translation_provider().name().to_owned();
+            let lyrics_changed =
+                on != this.enabled || enabled != this.enabled_providers || priority != this.priority;
+            let translation_changed = translation_on != this.translation_enabled
+                || translation_provider != this.translation_provider_name;
+            if !lyrics_changed && !translation_changed {
                 return;
             }
-            this.enabled = on;
-            this.enabled_providers = enabled.to_vec();
-            this.priority = priority;
-            this.task = None;
-            this.ahead = None;
-            this.ahead_of = None;
-            this.forget(cx);
-            this.follow(cx);
+            let provider_changed = translation_provider != this.translation_provider_name;
+            this.translation_enabled = translation_on;
+            this.translation_provider_name = translation_provider;
+            if lyrics_changed {
+                this.enabled = on;
+                this.enabled_providers = enabled.to_vec();
+                this.priority = priority;
+                this.task = None;
+                this.ahead = None;
+                this.ahead_of = None;
+                this.translate_task = None;
+                this.translate_failed_for = None;
+                this.forget(cx);
+                this.follow(cx);
+                return;
+            }
+            // Only the translation settings changed, so the lyrics on screen stay: a new
+            // provider translates them again, and switching translation off only hides the
+            // translated lanes until it is switched back on.
+            if provider_changed {
+                this.clear_translations();
+                this.translate_failed_for = None;
+            }
+            match translation_on {
+                true => this.maybe_translate(cx),
+                false => cx.notify(),
+            }
         })
         .detach();
         let enabled = settings.read(cx).lyrics_enabled();
         let enabled_providers = settings.read(cx).lyrics_providers().to_vec();
         let priority = settings.read(cx).lyrics_provider_priority();
+        let translation_enabled = settings.read(cx).lyrics_translation_enabled();
+        let translation_provider_name =
+            settings.read(cx).translation_provider().name().to_owned();
         let store = Sheets::new(storage::Cache::standard());
         let moving = store.clone();
         let migration = cx
@@ -120,10 +157,15 @@ impl Lyrics {
             session,
             settings,
             io,
+            http: reqwest::Client::new(),
             task: None,
             ahead: None,
             ahead_of: None,
             save: None,
+            translate_task: None,
+            translate_failed_for: None,
+            translation_enabled,
+            translation_provider_name,
             _migration: migration,
         }
     }
@@ -156,6 +198,7 @@ impl Lyrics {
         self.picked = true;
         self.revision = self.revision.wrapping_add(1);
         cx.notify();
+        self.maybe_translate(cx);
     }
 
     pub fn active_line(&self, cx: &Context<Self>) -> Option<usize> {
@@ -186,6 +229,8 @@ impl Lyrics {
         self.chosen = 0;
         self.picked = false;
         self.settled = false;
+        self.translate_task = None;
+        self.translate_failed_for = None;
         self.revision = self.revision.wrapping_add(1);
 
         let query = self.query(&track, &id, cx);
@@ -220,6 +265,7 @@ impl Lyrics {
         self.hits = ordered(query, hits, &priority);
         self.state = state_for(&self.hits, instrumental);
         cx.notify();
+        self.maybe_translate(cx);
         self.prefetch(cx);
     }
 
@@ -321,6 +367,8 @@ impl Lyrics {
             return;
         }
         self.task = None;
+        self.translate_task = None;
+        self.translate_failed_for = None;
         self.following = None;
         self.hits.clear();
         self.chosen = 0;
@@ -611,6 +659,7 @@ impl Lyrics {
             self.state = state_for(&self.hits, instrumental);
         }
         cx.notify();
+        self.maybe_translate(cx);
         self.prefetch(cx);
     }
 
@@ -627,6 +676,135 @@ impl Lyrics {
         self.picked &= held;
         if before.as_ref() != self.current().map(|hit| &hit.lyrics) {
             self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// Translates the lyrics on screen, once per track, when translation is on and the
+    /// current sheet carries no translation yet. A translation that arrives is kept with
+    /// the sheet, so the track is not translated again; a failed one is neither kept nor
+    /// retried, and a provider whose key is wrong is toasted about once per track.
+    fn maybe_translate(&mut self, cx: &mut Context<Self>) {
+        if self.translate_task.is_some() {
+            return;
+        }
+        let Some(id) = self.following.clone() else {
+            return;
+        };
+        if self.state == LyricsState::Instrumental {
+            return;
+        }
+        let Some(hit) = self.current().cloned() else {
+            return;
+        };
+        if translated(&hit.lyrics) {
+            return;
+        }
+        let settings = self.settings.read(cx);
+        if !settings.lyrics_translation_enabled() {
+            return;
+        }
+        let provider = settings.translation_provider();
+        let provider_name = provider.name().to_owned();
+        let needs_key = provider.needs_key();
+        let toast_key = match &provider {
+            music::lyrics::translate::Provider::Gemini => Some("toast-translation-failed-gemini"),
+            music::lyrics::translate::Provider::OpenAI => Some("toast-translation-failed-openai"),
+            music::lyrics::translate::Provider::OpenAiCompatible => {
+                Some("toast-translation-failed-openai-compatible")
+            }
+            music::lyrics::translate::Provider::Google => None,
+        };
+        let request = music::lyrics::translate::TranslateRequest {
+            provider,
+            base_url: settings.translation_base_url().to_owned(),
+            model: settings.translation_model().to_owned(),
+        };
+        let http = self.http.clone();
+        let lyrics = hit.lyrics.clone();
+        self.translate_task = Some(cx.spawn(async move |this, cx| {
+            let outcome =
+                music::lyrics::translate::translate_sheet(&lyrics, &request, &http).await;
+            this.update(cx, |this, cx| {
+                if this.following.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                this.translate_task = None;
+                match outcome {
+                    Ok(translated) => this.keep_translation(id, hit, translated, cx),
+                    Err(_) => {
+                        // The error is left out on purpose: a provider error can name the
+                        // request it failed on, and a key must never reach the log.
+                        log::warn!("lyrics: translation with {provider_name} failed");
+                        let toasted = this.translate_failed_for.as_ref().is_some_and(|failed| {
+                            failed.0 == id && failed.1 == provider_name
+                        });
+                        if needs_key && !toasted {
+                            if let Some(key) = toast_key {
+                                this.translate_failed_for = Some((id, provider_name.clone()));
+                                Toasts::show(Outcome::Failed, key, cx);
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Keeps a translated sheet where the untranslated one was: on screen, in the answers
+    /// held in memory, and, for a track the services may be asked about, in the cache
+    /// database, through the same unsaved path a lookup uses. A file's own lyrics are
+    /// never kept, so an edit to its tags shows on the next play.
+    fn keep_translation(
+        &mut self,
+        id: String,
+        untranslated: LyricsHit,
+        translated: music::Lyrics,
+        cx: &mut Context<Self>,
+    ) {
+        let persistable = self.online(&id, cx);
+        let key = persistable.then(|| self.key(&id, cx));
+        let mut changed = false;
+        if let Some(hit) = self.hits.iter_mut().find(|hit| same(hit, &untranslated)) {
+            hit.lyrics = translated.clone();
+            changed = true;
+        }
+        let mut pending = None;
+        if let Some((_, found)) = self.recent.iter_mut().find(|(held, _)| *held == id) {
+            if let Some(hit) = found.hits.iter_mut().find(|hit| same(hit, &untranslated)) {
+                hit.lyrics = translated;
+                changed = true;
+                if let Some(key) = key {
+                    pending = Some(Sheets::unsaved(key, &found.hits, &found.answered));
+                }
+            }
+        }
+        if let Some(pending) = pending {
+            self.unsaved.push(pending);
+            self.schedule_save(cx);
+        }
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+            cx.notify();
+            // The listener may have picked another sheet while this one was translating;
+            // that one still wants translating.
+            if self.current().is_some_and(|hit| !same(hit, &untranslated)) {
+                self.maybe_translate(cx);
+            }
+        }
+    }
+
+    /// Drops every translation held in memory, so the sheets are translated again with
+    /// the provider now chosen. Sheets already saved in the cache database keep the old
+    /// provider's translations until the track is translated again.
+    fn clear_translations(&mut self) {
+        for hit in &mut self.hits {
+            drop_translations(&mut hit.lyrics);
+        }
+        for (_, found) in &mut self.recent {
+            for hit in &mut found.hits {
+                drop_translations(&mut hit.lyrics);
+            }
         }
     }
 
@@ -665,6 +843,27 @@ fn same(left: &LyricsHit, right: &LyricsHit) -> bool {
         && left.album == right.album
         && left.duration == right.duration
         && left.lyrics.worded() == right.lyrics.worded()
+}
+
+/// Whether a sheet already carries a translation: any translated line, or a translated
+/// plain text.
+fn translated(lyrics: &music::Lyrics) -> bool {
+    match lyrics {
+        music::Lyrics::Plain { translated, .. } => translated.is_some(),
+        music::Lyrics::Synced { lines } => lines.iter().any(|line| line.translated.is_some()),
+    }
+}
+
+/// Drops a sheet's translation, leaving the lyrics themselves alone.
+fn drop_translations(lyrics: &mut music::Lyrics) {
+    match lyrics {
+        music::Lyrics::Plain { translated, .. } => *translated = None,
+        music::Lyrics::Synced { lines } => {
+            for line in Arc::make_mut(lines) {
+                line.translated = None;
+            }
+        }
+    }
 }
 
 fn ordered(query: &LyricsQuery, hits: Vec<LyricsHit>, priority: &[String]) -> Vec<LyricsHit> {

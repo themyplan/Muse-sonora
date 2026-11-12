@@ -5,6 +5,7 @@ use gpui::{
 };
 use i18n::t;
 use music::WritingSystem;
+use music::lyrics::translate::Provider;
 use router::{Destination, SettingsPage, navigate};
 use state::{AppSettings, LYRICS_SOURCES};
 use ui::{
@@ -13,7 +14,7 @@ use ui::{
 };
 
 use super::rows::drill;
-use super::{Group, SettingsView, Slot};
+use super::{Group, Row, SettingsView, Slot};
 
 /// A lyrics source being dragged within the priority list. It draws as a chip under the cursor
 /// and changes the saved order only when dropped.
@@ -39,6 +40,28 @@ impl SettingsView {
                 Slot::PanelLyricsSize,
                 Slot::FullscreenLyricsSize,
             ]),
+        );
+        // The translation group stands on its own: the switch alone while translation is off,
+        // the switch and the provider while the provider needs no key, and the full set —
+        // switch, provider, key, then the custom server's address and model, then Save —
+        // while an AI provider is picked, with the key box directly after the provider.
+        let settings = self.settings.read(cx);
+        let mut slots = vec![Slot::TranslationEnabled];
+        if settings.lyrics_translation_enabled() {
+            slots.push(Slot::TranslationProvider);
+            let provider = settings.translation_provider();
+            if provider.needs_key() {
+                slots.push(Slot::TranslationKey);
+                if provider == Provider::OpenAiCompatible {
+                    slots.push(Slot::TranslationBaseUrl);
+                    slots.push(Slot::TranslationModel);
+                }
+                slots.push(Slot::TranslationSave);
+            }
+        }
+        groups.push(
+            Group::new("settings-group-translation", "icons/mic-vocal.svg")
+                .rows(slots),
         );
         groups.push(
             Group::new("settings-group-sources", "icons/list-music.svg")
@@ -422,6 +445,165 @@ impl SettingsView {
             );
 
         self.row(t!("settings-romanized-lyrics"), action.into_any_element())
+    }
+
+    pub(super) fn translation_enabled_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.settings.read(cx).lyrics_translation_enabled();
+
+        Row::new(
+            t!("settings-lyrics-translation"),
+            Switch::new("translation-enabled", on)
+                .name(t!("settings-lyrics-translation"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings.update(cx, |settings, cx| {
+                        settings.set_lyrics_translation_enabled(!on, cx)
+                    });
+                }))
+                .into_any_element(),
+        )
+        .detail(t!("settings-lyrics-translation-detail"))
+        .into_any_element()
+    }
+
+    pub(super) fn translation_provider_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let provider = self.settings.read(cx).translation_provider();
+        let (_, current) = translation_provider_copy(provider);
+        let providers = [
+            Provider::Google,
+            Provider::Gemini,
+            Provider::OpenAI,
+            Provider::OpenAiCompatible,
+        ];
+        let picker = Picker::new(
+            "translation-provider",
+            &self.popovers,
+            i18n::lookup(current, None),
+        )
+        .width(Picker::REGULAR)
+        .sticky()
+        .items(providers.map(|variant| {
+            let (id, label) = translation_provider_copy(variant);
+            MenuItem::new(id, i18n::lookup(label, None))
+                .selected(variant == provider)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings.update(cx, |settings, cx| {
+                        settings.set_translation_provider(variant, cx);
+                    });
+                    cx.notify();
+                }))
+        }));
+        let row = Row::new(
+            t!("settings-translation-provider"),
+            picker
+                .name(t!("settings-translation-provider"))
+                .into_any_element(),
+        );
+        let row = match provider.needs_key() {
+            true => row,
+            false => row.detail(t!("settings-translation-no-key-needed")),
+        };
+        row.into_any_element()
+    }
+
+    /// The key field, masked and always starting empty: a saved key is never read back into
+    /// it, and typing here saves nothing. The row says when a key is already saved for the
+    /// provider picked above; otherwise the field's hint asks for one.
+    pub(super) fn translation_key_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let settings = self.settings.read(cx);
+        let saved = settings.translation_key_saved(settings.translation_provider());
+        let row = Row::new(
+            t!("settings-translation-key"),
+            div()
+                .w(Picker::WIDE)
+                .child(self.translation_key.clone())
+                .into_any_element(),
+        );
+        let row = match saved {
+            true => row.detail(t!("settings-translation-key-saved")),
+            false => row,
+        };
+        row.into_any_element()
+    }
+
+    pub(super) fn translation_base_url_row(&self) -> AnyElement {
+        self.row(
+            t!("settings-translation-base-url"),
+            div()
+                .w(Picker::WIDE)
+                .child(self.translation_base_url.clone())
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn translation_model_row(&self) -> AnyElement {
+        self.row(
+            t!("settings-translation-model"),
+            div()
+                .w(Picker::WIDE)
+                .child(self.translation_model.clone())
+                .into_any_element(),
+        )
+    }
+
+    /// The Save button, standing on its own at the row's end. It keeps a typed key, and the
+    /// custom server's address and model while that provider is picked, then clears the key
+    /// field so the key never lingers on screen. It stands held while the provider needs a
+    /// key, nothing is typed, and none is saved yet, so a first press cannot silently keep
+    /// nothing.
+    pub(super) fn translation_save_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let settings = self.settings.read(cx);
+        let provider = settings.translation_provider();
+        let needs_key = provider.needs_key();
+        let saved = settings.translation_key_saved(provider);
+        let nothing_typed = self.translation_key.read(cx).text().trim().is_empty();
+        let disabled = needs_key && nothing_typed && !saved;
+
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .min_h(theme.metrics.list_row)
+            .child(
+                Button::new("translation-save")
+                    .secondary()
+                    .small()
+                    .label(t!("common-save"))
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let provider = this.settings.read(cx).translation_provider();
+                        let custom = provider == Provider::OpenAiCompatible;
+                        let key = this.translation_key.read(cx).text().trim().to_owned();
+                        if !key.is_empty() {
+                            this.settings.update(cx, |settings, cx| {
+                                settings.save_translation_key(provider, key, cx);
+                            });
+                        }
+                        if custom {
+                            let base_url = this.translation_base_url.read(cx).text().to_owned();
+                            let model = this.translation_model.read(cx).text().to_owned();
+                            this.settings.update(cx, |settings, cx| {
+                                settings.set_translation_base_url(base_url, cx);
+                                settings.set_translation_model(model, cx);
+                            });
+                        }
+                        this.translation_key.update(cx, |input, cx| input.set_text("", cx));
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+pub(super) fn translation_provider_copy(provider: Provider) -> (&'static str, &'static str) {
+    match provider {
+        Provider::Google => ("translation-provider-google", "settings-translation-provider-google"),
+        Provider::Gemini => ("translation-provider-gemini", "settings-translation-provider-gemini"),
+        Provider::OpenAI => ("translation-provider-openai", "settings-translation-provider-openai"),
+        Provider::OpenAiCompatible => (
+            "translation-provider-openai-compatible",
+            "settings-translation-provider-openai-compatible",
+        ),
     }
 }
 

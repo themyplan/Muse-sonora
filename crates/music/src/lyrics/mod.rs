@@ -85,10 +85,12 @@ pub fn reshape(hits: &mut [LyricsHit]) {
     else {
         return;
     };
-    for hit in hits
-        .iter_mut()
-        .filter(|hit| hit.lyrics.worded() && hit.trust < TRUSTED && !layered(&hit.lyrics))
-    {
+    for hit in hits.iter_mut().filter(|hit| {
+        hit.lyrics.worded()
+            && hit.trust < TRUSTED
+            && !layered(&hit.lyrics)
+            && !translated(&hit.lyrics)
+    }) {
         if let Some(conformed) = shape::conform(&hit.lyrics, &guide) {
             hit.lyrics = conformed;
         }
@@ -102,6 +104,16 @@ fn layered(lyrics: &Lyrics) -> bool {
     lines
         .iter()
         .any(|line| !line.secondary.is_empty() || !line.voice.lead())
+}
+
+/// Whether a sheet already carries a translation: any translated line, or a translated
+/// plain text. A translated sheet was already shaped once; shaping it again would only
+/// destroy the translation.
+fn translated(lyrics: &Lyrics) -> bool {
+    match lyrics {
+        Lyrics::Plain { translated, .. } => translated.is_some(),
+        Lyrics::Synced { lines } => lines.iter().any(|line| line.translated.is_some()),
+    }
 }
 
 pub fn eligible(query: &LyricsQuery, hit: &LyricsHit) -> bool {

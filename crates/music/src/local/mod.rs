@@ -42,9 +42,13 @@ impl LocalProvider {
     async fn scan_paths(&self, paths: Vec<PathBuf>) -> Result<ProviderSession> {
         let cache_dir = self.cache_dir.clone();
         let index = self.index.clone();
-        let scanned = tokio::task::spawn_blocking(move || scan::scan(&paths, &cache_dir, &index))
-            .await
-            .context("local scan task panicked")?;
+        // The scan runs on a blocking thread and moves its own copy; the client
+        // below keeps the other one, so the scan gets a clone.
+        let scan_cache_dir = cache_dir.clone();
+        let scanned =
+            tokio::task::spawn_blocking(move || scan::scan(&paths, &scan_cache_dir, &index))
+                .await
+                .context("local scan task panicked")?;
 
         let api: Arc<dyn MusicApi> = Arc::new(client::LocalClient::new(
             scanned,

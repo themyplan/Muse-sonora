@@ -7,14 +7,15 @@ use async_trait::async_trait;
 use storage::Database;
 
 use crate::cover::{self, CoverLimits};
+use crate::order;
 use crate::{
     Album, AlbumCatalogue, AlbumDetail, Artist, ArtistProfile, GenreItem, GenreSection, HomeFeed,
-    ImportedPlaylist, MediaKind, MusicApi, Playlist, PlaylistDetail, SUGGESTIONS, SavedArtist,
-    Track, TrackTags, UserProfile, distinct_covers,
+    ImportedPlaylist, MediaKind, MusicApi, Playlist, PlaylistDetail, ReleaseType, SUGGESTIONS,
+    SavedArtist, Track, TrackTags, UserProfile, distinct_covers,
 };
 
-use super::index::Index;
-use super::scan::Scanned;
+use super::index::{Index, Known};
+use super::scan::{Scanned, dated, folder_name};
 use super::store::{Starred, Store, Stored};
 use super::{m3u, tags, wire};
 
@@ -61,14 +62,18 @@ pub struct LocalClient {
     scanned: RwLock<Scanned>,
     store: Store,
     index: Index,
+    /// Where extracted cover art is cached, so a file opened from disk gets the same cover
+    /// the scan would have given it.
+    cache_dir: PathBuf,
 }
 
 impl LocalClient {
-    pub fn new(scanned: Scanned, database: Database, index: Index) -> Self {
+    pub fn new(scanned: Scanned, database: Database, index: Index, cache_dir: PathBuf) -> Self {
         Self {
             scanned: RwLock::new(scanned),
             store: Store::new(database),
             index,
+            cache_dir,
         }
     }
 
@@ -82,6 +87,21 @@ impl LocalClient {
                     .find(|track| track.id.as_deref() == Some(id.as_str()))
                     .cloned()
             })
+            .collect()
+    }
+
+    /// The index of each of `ids` the library holds, which are the ones `listed` keeps.
+    fn held(&self, ids: &[String]) -> Vec<usize> {
+        let scanned = self.scanned.read().unwrap();
+        let known: HashSet<&str> = scanned
+            .tracks
+            .iter()
+            .filter_map(|track| track.id.as_deref())
+            .collect();
+        ids.iter()
+            .enumerate()
+            .filter(|(_, id)| known.contains(id.as_str()))
+            .map(|(index, _)| index)
             .collect()
     }
 
@@ -157,6 +177,99 @@ impl LocalClient {
         (found, skipped)
     }
 
+    /// The tags of a file opened from disk, with the folder art beside it standing in when the
+    /// file carries no cover of its own. The same fallback the provider's `track_from_path`
+    /// uses, so the track the library keeps is the one that played.
+    fn read_opened(&self, path: &Path) -> Option<wire::Tagged> {
+        let mut tagged = wire::track_from_file(path, None, None, &self.cache_dir)?;
+        if tagged.track.cover.is_none() {
+            tagged.track.cover = wire::art_beside(path);
+        }
+        Some(tagged)
+    }
+
+    /// Adds one freshly read file to the in-memory library, with its album and artists, the way
+    /// the scan groups them: an album already there gains the track through its id, a new one
+    /// is built from this track alone, and each credited artist is added or kept with the
+    /// latest date. The album's folder art is left for the next scan, which looks at folders.
+    fn admit(&self, tagged: wire::Tagged) {
+        let mut scanned = self.scanned.write().unwrap();
+        let track = tagged.track.clone();
+        let Some(id) = track.id.clone() else {
+            return;
+        };
+        if scanned
+            .tracks
+            .iter()
+            .any(|held| held.id.as_deref() == Some(id.as_str()))
+        {
+            return;
+        }
+        scanned.tracks.push(track.clone());
+        if let Some(album_id) = track.album_id.clone() {
+            match scanned
+                .albums
+                .iter_mut()
+                .find(|album| album.id == album_id)
+            {
+                Some(album) => {
+                    album.track_count += 1;
+                    album.added_at = album.added_at.max(track.added_at);
+                    if album.cover.is_none() {
+                        album.cover = track.cover.clone();
+                        album.cover_large = track.cover.clone();
+                    }
+                }
+                None => {
+                    let album_artists = (!tagged.album_artists.is_empty())
+                        .then(|| tagged.album_artists.clone())
+                        .unwrap_or_else(|| wire::shared_artists(std::slice::from_ref(&track)));
+                    let year = tagged.year
+                        .or_else(|| {
+                            track
+                                .id
+                                .as_deref()
+                                .and_then(wire::path_from_track_id)
+                                .and_then(Path::parent)
+                                .and_then(|dir| dated(&folder_name(dir)).1)
+                        })
+                        .unwrap_or(0);
+                    let release = tagged.release.unwrap_or(ReleaseType::Album);
+                    scanned.albums.push(wire::album_from_tracks(
+                        &album_id,
+                        &track.album,
+                        &album_artists,
+                        std::slice::from_ref(&track),
+                        year,
+                        release,
+                        tagged.label.clone(),
+                    ));
+                }
+            }
+        }
+        for artist_ref in &track.artist_refs {
+            let artist_id = artist_ref
+                .id
+                .clone()
+                .unwrap_or_else(|| wire::artist_id(&artist_ref.name));
+            match scanned
+                .artists
+                .iter_mut()
+                .find(|artist| artist.id == artist_id)
+            {
+                Some(artist) => {
+                    artist.added_at = artist.added_at.max(track.added_at);
+                }
+                None => scanned.artists.push(SavedArtist {
+                    id: artist_id,
+                    name: artist_ref.name.clone(),
+                    cover: track.cover.clone(),
+                    added_at: track.added_at,
+                }),
+            }
+        }
+    }
+
     /// One album's tracks in playing order. The scan keeps every track in the order the
     /// folders were walked, which is not the order an album is meant to be heard in.
     fn album_songs(&self, album_id: &str) -> Vec<Track> {
@@ -192,6 +305,7 @@ fn playlist_from(stored: Stored, tracks: &[Track]) -> Playlist {
         cover: own.or_else(|| tracks.iter().find_map(|track| track.cover.clone())),
         track_count: tracks.len() as u32,
         modified_at: Some(stored.modified_at / 1_000),
+        read_only: false,
     }
 }
 
@@ -239,6 +353,7 @@ impl MusicApi for LocalClient {
             banner: None,
             biography: None,
             monthly_listeners: None,
+            followers: None,
             top_tracks: scanned
                 .tracks
                 .iter()
@@ -434,10 +549,32 @@ impl MusicApi for LocalClient {
         self.store.remove(playlist_id, track_id)
     }
 
+    /// Counts the moves in the tracks the library still holds, so a stored track whose file has
+    /// gone keeps its place among the others.
+    async fn reorder_playlist(
+        &self,
+        playlist_id: &str,
+        seen: &[String],
+        wanted: &[String],
+    ) -> Result<()> {
+        let mut stored = self.store.tracks(playlist_id)?;
+        let held = self.held(&stored);
+        let listed: Vec<Option<&str>> = held
+            .iter()
+            .map(|&index| Some(stored[index].as_str()))
+            .collect();
+        order::confirm(&listed, seen)?;
+        let steps = order::moves(seen, wanted)?;
+        for placement in order::placements(stored.len(), &held, &steps)? {
+            order::move_item(&mut stored, placement.from, placement.to());
+        }
+        self.store.reorder(playlist_id, &stored)
+    }
+
     async fn import_playlist(&self, path: &Path) -> Result<ImportedPlaylist> {
         let bytes =
             std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-        let folder = path.parent().unwrap_or(Path::new(""));
+        let folder = path.parent().unwrap_or_else(|| Path::new(""));
         let (found, skipped) = self.find_files(&m3u::read(&bytes, folder));
         let name = path
             .file_stem()
@@ -461,7 +598,7 @@ impl MusicApi for LocalClient {
 
     async fn export_playlist(&self, playlist_id: &str, path: &Path) -> Result<()> {
         let tracks = self.listed(&self.store.tracks(playlist_id)?);
-        let folder = path.parent().unwrap_or(Path::new(""));
+        let folder = path.parent().unwrap_or_else(|| Path::new(""));
         std::fs::write(path, m3u::write(&tracks, folder))
             .with_context(|| format!("cannot write {}", path.display()))
     }
@@ -607,6 +744,50 @@ impl MusicApi for LocalClient {
         Ok(())
     }
 
+    /// Records files the user opened straight from disk, so they join the library instead of
+    /// living only in the queue. Each new file is read once for its tags, written to the scan
+    /// index so it survives a restart, and added to the in-memory library with its album and
+    /// artists, the way a scan would have grouped it. A file the library already holds, or one
+    /// whose tags cannot be read, is left alone. It answers how many files were new.
+    fn remember_opened(&self, paths: &[PathBuf]) -> usize {
+        let mut added = 0;
+        for path in paths {
+            let id = wire::track_id(path);
+            if self
+                .scanned
+                .read()
+                .unwrap()
+                .tracks
+                .iter()
+                .any(|track| track.id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            let Some(tagged) = self.read_opened(path) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(path) else {
+                log::warn!("local: cannot stat {}", path.display());
+                continue;
+            };
+            let Some(mtime) = wire::modified_at(path) else {
+                log::warn!("local: cannot stat {}", path.display());
+                continue;
+            };
+            self.index.remember(
+                path,
+                Known {
+                    mtime,
+                    size: metadata.len(),
+                    tagged: tagged.clone(),
+                },
+            );
+            self.admit(tagged);
+            added += 1;
+        }
+        added
+    }
+
     async fn home(&self) -> Result<HomeFeed> {
         let (tracks, albums) = {
             let scanned = self.scanned.read().unwrap();
@@ -695,7 +876,7 @@ impl MusicApi for LocalClient {
         let playlists = self.playlists().await.unwrap_or_default();
         if !playlists.is_empty() {
             sections.push(GenreSection {
-                title: "home-playlists".to_owned(),
+                title: "nav-playlists".to_owned(),
                 items: playlists
                     .into_iter()
                     .take(15)
@@ -785,8 +966,10 @@ mod tests {
             artist_refs: vec![ArtistRef {
                 name: artists.to_owned(),
                 id: None,
+                channel: false,
             }],
             album: album.to_owned(),
+            album_artist: String::new(),
             album_id: None,
             cover: None,
             duration: Duration::from_secs(180),
@@ -828,7 +1011,7 @@ mod tests {
             artists: vec![],
         };
 
-        let client = LocalClient::new(scanned, db.clone(), index);
+        let client = LocalClient::new(scanned, db.clone(), index, dir.clone());
 
         // Star track 0 and 1
         client.set_track_saved("local:0", true).await.unwrap();
@@ -853,6 +1036,113 @@ mod tests {
         assert!(ids.contains(&"local:0"));
         assert!(ids.contains(&"local:1"));
         assert!(ids.contains(&"local:2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn moves_a_playlist_track_down_and_up_and_keeps_the_order() {
+        let dir = std::env::temp_dir().join(format!("sonora-test-{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::at(dir.join("state.sqlite"));
+        let index = Index::new(storage::Cache::at(dir.join("cache.sqlite")));
+        let tracks = (0..4)
+            .map(|i| {
+                test_track(
+                    &format!("local:{i}"),
+                    &format!("Track {i}"),
+                    "Artist",
+                    "Album",
+                )
+            })
+            .collect();
+        let scanned = Scanned {
+            tracks,
+            albums: vec![],
+            portraits: HashMap::new(),
+            artists: vec![],
+        };
+        let client = LocalClient::new(scanned, db.clone(), index, dir.clone());
+        let id = client.create_playlist("Mix").await.unwrap();
+        // local:gone names a file the library no longer holds, so the listing leaves it out
+        let stored: Vec<String> = ["local:0", "local:gone", "local:1", "local:2", "local:3"]
+            .map(str::to_owned)
+            .to_vec();
+        client.store.extend(&id, &stored).unwrap();
+        let listed = async |client: &LocalClient| -> Vec<String> {
+            let detail = client.playlist(&id).await.unwrap();
+            detail
+                .tracks
+                .into_iter()
+                .filter_map(|track| track.id)
+                .collect()
+        };
+
+        let moved = |shown: &[String], from: usize, to: usize| {
+            let mut wanted = shown.to_vec();
+            order::move_item(&mut wanted, from, to);
+            wanted
+        };
+        let shown = listed(&client).await;
+        client
+            .reorder_playlist(&id, &shown, &moved(&shown, 0, 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&client).await,
+            ["local:1", "local:2", "local:0", "local:3"]
+        );
+
+        let shown = listed(&client).await;
+        client
+            .reorder_playlist(&id, &shown, &moved(&shown, 3, 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&client).await,
+            ["local:3", "local:1", "local:2", "local:0"]
+        );
+        // the missing file stays put, and the moved track goes in front of the next listed row
+        assert_eq!(
+            client.store.tracks(&id).unwrap(),
+            ["local:gone", "local:3", "local:1", "local:2", "local:0"]
+        );
+
+        // a listing that changed since the listener saw it moves nothing
+        let stale = ["local:1", "local:2", "local:0", "local:3"].map(str::to_owned);
+        assert!(
+            client
+                .reorder_playlist(&id, &stale, &moved(&stale, 1, 0))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            listed(&client).await,
+            ["local:3", "local:1", "local:2", "local:0"]
+        );
+
+        // a new client over the same database reads the kept order, as after a restart
+        let index = Index::new(storage::Cache::at(dir.join("cache.sqlite")));
+        let scanned = Scanned {
+            tracks: (0..4)
+                .map(|i| {
+                    test_track(
+                        &format!("local:{i}"),
+                        &format!("Track {i}"),
+                        "Artist",
+                        "Album",
+                    )
+                })
+                .collect(),
+            albums: vec![],
+            portraits: HashMap::new(),
+            artists: vec![],
+        };
+        let reopened = LocalClient::new(scanned, db, index, dir.clone());
+        assert_eq!(
+            listed(&reopened).await,
+            ["local:3", "local:1", "local:2", "local:0"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

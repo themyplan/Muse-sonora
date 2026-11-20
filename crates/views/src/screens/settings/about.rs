@@ -6,7 +6,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, div, img};
 use i18n::t;
 use state::Channel;
-use ui::{ActiveTheme as _, Avatar, Switch, Text};
+use ui::{ActiveTheme as _, Avatar, Glowing as _, Switch, Text};
 
 use super::rows::{outward, segmented};
 use super::{Group, SettingsView, Slot, group_heading};
@@ -64,21 +64,33 @@ const MEMBERS: [Member; 5] = [
 
 impl SettingsView {
     pub(super) fn about_groups(&self) -> Vec<Group> {
-        let channel = state::updates_itself().then_some(Slot::Channel);
+        let itself = state::updates_itself()
+            .then_some([Slot::AutoUpdate, Slot::Channel])
+            .into_iter()
+            .flatten();
         vec![
             Group::untitled().rows(
                 [Slot::Version, Slot::Updates]
                     .into_iter()
-                    .chain(channel)
+                    .chain(itself)
                     .chain([Slot::Log, Slot::License, Slot::Source]),
             ),
         ]
     }
 
+    /// The version row, which for a nightly also names the commit it was built from.
     pub(super) fn version_row(&self) -> AnyElement {
+        let version: SharedString = match state::commit() {
+            Some(commit) => t!(
+                "settings-version-commit",
+                version = state::version(),
+                commit = commit
+            ),
+            None => state::version().into(),
+        };
         self.row(
             t!("settings-version"),
-            ui::spoken("settings-version-value", state::VERSION).into_any_element(),
+            ui::spoken("settings-version-value", version).into_any_element(),
         )
     }
 
@@ -92,6 +104,21 @@ impl SettingsView {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.settings
                         .update(cx, |settings, cx| settings.set_check_updates(!on, cx));
+                }))
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn auto_update_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.settings.read(cx).auto_update();
+
+        self.row(
+            t!("settings-auto-update"),
+            Switch::new("auto-update", on)
+                .name(t!("settings-auto-update"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| settings.set_auto_update(!on, cx));
                 }))
                 .into_any_element(),
         )
@@ -171,10 +198,10 @@ impl SettingsView {
                     .id("settings-about-name")
                     .role(gpui::accesskit::Role::Heading)
                     .aria_level(2)
-                    .aria_label(t!("settings-about-name"))
+                    .aria_label(t!("common-sonora"))
                     .text_size(theme.text(Text::Title))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(t!("settings-about-name")),
+                    .child(t!("common-sonora")),
             )
     }
 
@@ -220,7 +247,6 @@ impl SettingsView {
                     .px_3()
                     .rounded(theme.radius)
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.secondary_hover))
                     .on_click(move |_, _, cx| cx.open_url(member.profile))
                     .child(Avatar::new(Some(member.avatar)).size(theme.metrics.thumb))
                     .child(
@@ -238,6 +264,7 @@ impl SettingsView {
                             .text_color(theme.muted_foreground)
                             .child(member.role.label()),
                     )
+                    .glowed(theme.secondary_hover)
             }))
     }
 }

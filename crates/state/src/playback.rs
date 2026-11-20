@@ -1412,6 +1412,7 @@ impl Playback {
         cx: &mut Context<Self>,
     ) {
         let provider = self.session.read(cx).local_provider();
+        let api = self.session.read(cx).local_client();
         let previous_open = self.pending_open.take();
         self.pending_open = Some(Io::global(cx).load(
             async move {
@@ -1419,24 +1420,38 @@ impl Playback {
                     previous.await;
                 }
                 let mut tracks = Vec::new();
+                let mut read = Vec::new();
                 let mut unread = Vec::new();
                 for path in paths {
                     match provider.track_from_path(&path) {
-                        Some(track) => tracks.push(track),
+                        Some(track) => {
+                            read.push(path);
+                            tracks.push(track);
+                        }
                         None => {
                             log::warn!("local: cannot open {}", path.display());
                             unread.push(Unread::of(&path));
                         }
                     }
                 }
-                anyhow::Ok((tracks, unread))
+                // A file opened straight from disk joins the library, so it is still there
+                // after a restart instead of living only in the queue.
+                let remembered = api
+                    .as_ref()
+                    .map_or(0, |api| api.remember_opened(&read));
+                anyhow::Ok((tracks, unread, remembered))
             },
             move |this, loaded, cx| match loaded {
-                Ok((tracks, unread)) => {
+                Ok((tracks, unread, remembered)) => {
                     if drop.is_none() && !tail {
                         this.opening = true;
                     }
                     report_unread(&unread, tracks.is_empty(), cx);
+                    if remembered > 0 {
+                        this.session.update(cx, |session, cx| {
+                            session.note_local_changed(cx);
+                        });
+                    }
                     if tracks.is_empty() {
                         return;
                     }

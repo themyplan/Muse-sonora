@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::actions;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ShapedLine, SharedString,
-    UTF16Selection, Window, point, px,
+    App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, Focusable, Global,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ShapedLine,
+    SharedString, UTF16Selection, Window, point, px,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -60,6 +60,13 @@ static PRIMARY_PASTE: AtomicBool = AtomicBool::new(true);
 
 type Motion = fn(&str, usize) -> usize;
 
+/// Set while a press that `keep_focus` claimed for a field is dispatched, so the field it landed
+/// outside of does not let go of the focus.
+#[derive(Default)]
+struct Kept(bool);
+
+impl Global for Kept {}
+
 /// Re-reads GNOME's middle-click paste switch through the settings portal and repaints every
 /// window when it changed. A desktop that does not expose the switch keeps middle-click paste on.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -86,6 +93,17 @@ pub fn refresh_primary_paste(cx: &mut App) {
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub fn refresh_primary_paste(_cx: &mut App) {}
+
+/// Keeps the focused field focused through the press being dispatched now. A panel that hangs
+/// off a field, such as a `Dropdown` under it, calls this from a capture listener.
+pub(crate) fn keep_focus(window: &mut Window, cx: &mut App) {
+    cx.set_global(Kept(true));
+    // The field decides in a call deferred before this one, and the hold outlives it by one more
+    // deferral whichever of the two listeners ran first.
+    window.defer(cx, |window, cx| {
+        window.defer(cx, |_, cx| cx.set_global(Kept(false)))
+    });
+}
 
 /// Whether a middle click in a field pastes the primary selection right now.
 fn primary_paste() -> bool {
@@ -256,6 +274,9 @@ pub struct Input {
     compact: bool,
     tucked: bool,
     blurred: bool,
+    /// Whether the field draws no fill or border of its own, for one that is the whole surface
+    /// it sits on.
+    bare: bool,
     clearable: bool,
     masked: bool,
     /// Whether the text keeps to the field's end rather than its start, as a column of numbers.
@@ -279,6 +300,12 @@ pub struct Input {
     selecting: bool,
     selected_word: Option<Range<usize>>,
     context_menu: Option<Point<Pixels>>,
+    /// A press landed outside the field while its context menu was open, during this frame. If
+    /// the menu closes on that press without an item picked, the press dismissed it and the field
+    /// lets go of the focus.
+    pressed_out: bool,
+    /// When the focus ring last came or went, so the render can fade it between the two.
+    ring: crate::motion::Movement,
 }
 
 impl Input {
@@ -291,6 +318,7 @@ impl Input {
             compact: false,
             tucked: false,
             blurred: false,
+            bare: false,
             clearable: false,
             masked: false,
             end: false,
@@ -307,6 +335,8 @@ impl Input {
             selecting: false,
             selected_word: None,
             context_menu: None,
+            pressed_out: false,
+            ring: crate::motion::Movement::new(false),
         }
     }
 
@@ -331,6 +361,13 @@ impl Input {
     /// `blurring` itself at render.
     pub fn blurred(mut self) -> Self {
         self.blurred = true;
+        self
+    }
+
+    /// Drops the field's fill and border and gives it a list row's height and a larger icon,
+    /// for a field that fills the surface around it, such as the line atop the quick search.
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
         self
     }
 
@@ -377,6 +414,15 @@ impl Input {
     pub fn shortcut(mut self, keystroke: impl Into<SharedString>) -> Self {
         self.shortcut = Some(keystroke.into());
         self
+    }
+
+    /// Changes the keystroke drawn at the field's end, for a shortcut the user rebinds. `None`
+    /// draws none.
+    pub fn set_shortcut(&mut self, keystroke: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.shortcut != keystroke {
+            self.shortcut = keystroke;
+            cx.notify();
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -697,6 +743,7 @@ impl Input {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.pressed_out = false;
         self.focus(window, cx);
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if event.button == MouseButton::Middle {
@@ -728,6 +775,56 @@ impl Input {
                 self.select_all(&SelectAll, window, cx);
             }
         }
+    }
+
+    /// Lets go of the focus when a press lands outside the field, so a click on the page around
+    /// it stops the typing. The decision waits until the press has been dispatched, so whatever
+    /// focusable thing it hit keeps the focus and a panel hanging off the field can hold it with
+    /// `keep_focus`. With the context menu open the press may pick one of its items, so the
+    /// decision waits for `context_menu_closed`. A press the menu takes without closing, as on
+    /// its padding, is forgotten by the next frame, so a later Escape keeps the focus.
+    fn on_mouse_down_out(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.context_menu.is_some() {
+            self.pressed_out = true;
+            cx.on_next_frame(window, |this, _, _| this.pressed_out = false);
+            return;
+        }
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        let field = cx.entity().downgrade();
+        let focus = self.focus_handle.clone();
+        window.defer(cx, move |window, cx| {
+            let kept = cx.try_global::<Kept>().is_some_and(|kept| kept.0);
+            if kept || !focus.is_focused(window) {
+                return;
+            }
+            window.blur(cx);
+            field
+                .update(cx, |this, cx| {
+                    this.selecting = false;
+                    cx.notify();
+                })
+                .ok();
+        });
+    }
+
+    /// Closes the context menu. A pick clears the menu before this runs, so a menu still open
+    /// here was dismissed, and one dismissed by a press outside takes the focus with it. Escape
+    /// leaves the focus in the field.
+    fn context_menu_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dismissed = self.context_menu.take().is_some();
+        let pressed_out = std::mem::take(&mut self.pressed_out);
+        if dismissed && pressed_out && self.focus_handle.is_focused(window) {
+            self.selecting = false;
+            window.blur(cx);
+        }
+        cx.notify();
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {

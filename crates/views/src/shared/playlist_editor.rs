@@ -1,13 +1,13 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Global, PathPromptOptions, Render, SharedString, Task,
+    App, Context, Div, Entity, FocusHandle, Global, PathPromptOptions, Render, SharedString, Task,
     Window, div,
 };
 use i18n::t;
 use music::Playlist;
 use state::{Addition, CoverEdit, Leaving, Outcome, Shelf, Sonora, Toasts, cover_problem};
-use ui::{ActiveTheme as _, Artwork, Button, Modal};
-use ui::{Dismiss, FORM_CONTEXT, Input, Submit};
+use ui::{ActiveTheme as _, Artwork, Button, Modal, PinKind, TabBar};
+use ui::{Dismiss, FORM_CONTEXT, Field, Form, Input, Submit};
 
 #[derive(Clone)]
 pub(crate) enum Edit {
@@ -120,6 +120,13 @@ impl PlaylistEditor {
         }));
     }
 
+    fn choose_shelf(&mut self, chosen: Shelf, cx: &mut Context<Self>) {
+        if let Some(Edit::Create { shelf, .. }) = &mut self.edit {
+            *shelf = chosen;
+            cx.notify();
+        }
+    }
+
     fn remove_cover(&mut self, cx: &mut Context<Self>) {
         self.cover = CoverEdit::Remove;
         cx.notify();
@@ -189,6 +196,52 @@ fn plain(edit: &Edit) -> bool {
 impl PlaylistEditor {
     /// The cover preview with its buttons beside the name field. The cover buttons show only
     /// where the provider takes a cover.
+    /// The playlist's name as a form of one field. Enter and Escape go on to the dialog around it.
+    fn name_form(&self, cx: &App) -> Form {
+        Form::new("playlist-name-form").field(Field::new(&self.name, cx))
+    }
+
+    /// Where a blank new playlist goes, the streaming account or the local files. It shows only
+    /// while both are there to take one, since songs already picked decide it for themselves.
+    fn shelves(&self, edit: &Edit, cx: &mut Context<Self>) -> Option<Div> {
+        let Edit::Create { addition, shelf } = edit else {
+            return None;
+        };
+        let session = Sonora::global(cx).session.read(cx);
+        let provider = session
+            .provider_name()
+            .filter(|_| session.authenticated())?;
+        if !addition.is_empty() || session.local_paths().is_empty() {
+            return None;
+        }
+        let chosen = *shelf;
+        let options = [
+            (
+                "playlist-shelf-streaming",
+                SharedString::from(provider),
+                Shelf::Streaming,
+            ),
+            (
+                "playlist-shelf-local",
+                t!("common-local-files"),
+                Shelf::Local,
+            ),
+        ];
+        let bar = TabBar::new("playlist-shelf")
+            .name(t!("playlist-create-shelf"))
+            .flex_none()
+            .items(options.map(|(id, label, option)| {
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .ghost()
+                    .selected(option == chosen)
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_shelf(option, cx)))
+            }));
+        // The modal sets each child in a block that would stretch the bar to its full width.
+        Some(div().flex().child(bar))
+    }
+
     fn details(&self, playlist: &Playlist, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
         let covers = Sonora::global(cx)
@@ -204,7 +257,7 @@ impl PlaylistEditor {
                 Artwork::new(self.preview(playlist, cx))
                     .size(theme.metrics.cover)
                     .corner_radius(theme.radius)
-                    .fallback("icons/list-music.svg")
+                    .fallback(PinKind::Playlist.icon())
                     .flex_none(),
             )
             .child(
@@ -214,9 +267,7 @@ impl PlaylistEditor {
                     .flex_1()
                     .min_w_0()
                     .gap_2()
-                    // The field grows along its parent's main axis, so a row keeps it from
-                    // filling the column down to the cover's height.
-                    .child(div().flex().child(self.name.clone()))
+                    .child(self.name_form(cx))
                     .when(covers, |column| {
                         column.child(
                             div()
@@ -266,8 +317,22 @@ impl Render for PlaylistEditor {
             Edit::Delete(_) => t!("playlist-delete-title"),
             Edit::Again { .. } => t!("playlist-again-title"),
         };
+        // A blank new playlist can come from an M3U file instead, which the local shelf reads.
+        let import =
+            matches!(&edit, Edit::Create { addition, .. } if addition.is_empty()).then(|| {
+                Button::new("import-playlist")
+                    .ghost()
+                    .small()
+                    .icon("icons/file-music.svg")
+                    .label(t!("menu-import-playlist"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close(window, cx);
+                        crate::shared::local::import_playlist(cx);
+                    }))
+            });
+        let shelves = self.shelves(&edit, cx);
         let detail = match &edit {
-            Edit::Delete(playlist) => Some(t!("playlist-delete-confirm", name = &playlist.name)),
+            Edit::Delete(playlist) => Some(t!("confirm-delete-named", name = &playlist.name)),
             Edit::Again { playlist, .. } => {
                 Some(t!("playlist-again-confirm", name = &playlist.name))
             }
@@ -291,10 +356,12 @@ impl Render for PlaylistEditor {
                 Modal::new("playlist-editor", title)
                     .w(theme.metrics.cover * 2.8)
                     .when_some(detail, Modal::detail)
+                    .when_some(import, Modal::trailing)
+                    .when_some(shelves, Modal::child)
                     .map(|modal| match &edit {
                         Edit::Details(playlist) => modal.child(self.details(playlist, cx)),
                         _ if asking => modal,
-                        _ => modal.child(self.name.clone()),
+                        _ => modal.child(self.name_form(cx)),
                     })
                     .action(
                         Button::new("cancel-playlist-edit")

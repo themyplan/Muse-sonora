@@ -1,9 +1,10 @@
-use gpui::{App, Context, Menu, MenuItem, OsAction};
+use gpui::{App, Context, Global, Menu, MenuItem, OsAction};
 use i18n::t;
 use input::{
     CloseWindow, DecreaseFontSize, Hide, HideOthers, IncreaseFontSize, MinimizeWindow,
-    OpenSettings, Quit, Redo, Refresh, ResetFontSize, ShowAll, SignOut, SongNext, SongPrevious,
-    TogglePlayback, ToggleRepeat, ToggleShuffle, Undo, ZoomWindow,
+    OpenSettings, Quit, Redo, Refresh, ResetFontSize, SeekBack, SeekForward, ShowAll, SignOut,
+    SongNext, SongPrevious, TogglePlayback, ToggleRepeat, ToggleShuffle, Undo, VolumeDown,
+    VolumeUp, ZoomWindow,
 };
 use router::Destination;
 use state::{AppSettings, Equalizer, Shelf, Sonora};
@@ -12,8 +13,28 @@ use ui::{ActiveTheme as _, Copy, Cut, Look, Paste, SelectAll, Theme};
 /// How far one font size shortcut moves the size, the same step as the buttons in Settings.
 const FONT_STEP: f32 = 1.;
 
+/// Present while a tray click closes the window, so Sonora stays in the tray even with close to
+/// tray turned off.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct HidingToTray;
+
+impl Global for HidingToTray {}
+
+/// Closes the window into the tray. Sonora keeps running whatever the close to tray setting says,
+/// since the tray it was hidden from brings it back.
+#[cfg(target_os = "linux")]
+pub fn hide_to_tray(cx: &mut App) {
+    let Some(window) = cx.windows().first().copied() else {
+        return;
+    };
+    cx.set_global(HidingToTray);
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .ok();
+}
+
 pub fn register(lingers: bool, cx: &mut App) {
-    cx.bind_keys(input::bindings());
+    bind_keys(cx);
 
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
@@ -24,7 +45,11 @@ pub fn register(lingers: bool, cx: &mut App) {
         if !cx.windows().is_empty() {
             return;
         }
-        let close_to_tray = Sonora::global(cx).settings.read(cx).close_to_tray();
+        let hiding = cx.has_global::<HidingToTray>();
+        if hiding {
+            cx.remove_global::<HidingToTray>();
+        }
+        let close_to_tray = hiding || Sonora::global(cx).settings.read(cx).close_to_tray();
         match lingers && close_to_tray {
             true => crate::dock::show(false),
             false => cx.quit(),
@@ -46,13 +71,17 @@ pub fn register(lingers: bool, cx: &mut App) {
             }
             at if !at.refreshes() => {}
             at => {
-                let shelf = match at {
-                    Destination::Local(_) => Shelf::Local,
-                    Destination::Album(id) | Destination::Playlist(id) => Shelf::of(&id),
-                    _ => Shelf::Streaming,
-                };
                 let library = Sonora::global(cx).library.clone();
-                library.update(cx, |library, cx| library.refresh(shelf, cx));
+                library.update(cx, |library, cx| match at {
+                    Destination::Album(id) | Destination::Playlist(id) => {
+                        library.refresh(Shelf::of(&id), cx)
+                    }
+                    Destination::Library(_) => {
+                        library.refresh(Shelf::Streaming, cx);
+                        library.refresh(Shelf::Local, cx);
+                    }
+                    _ => library.refresh(Shelf::Streaming, cx),
+                });
             }
         },
     );
@@ -71,6 +100,11 @@ pub fn register(lingers: bool, cx: &mut App) {
         let playback = Sonora::global(cx).playback.clone();
         playback.update(cx, |playback, cx| playback.next(cx));
     });
+
+    cx.on_action(|_: &VolumeUp, cx: &mut App| nudge_volume(cx, 1));
+    cx.on_action(|_: &VolumeDown, cx: &mut App| nudge_volume(cx, -1));
+    cx.on_action(|_: &SeekBack, cx: &mut App| skip(cx, false));
+    cx.on_action(|_: &SeekForward, cx: &mut App| skip(cx, true));
 
     cx.on_action(|_: &ToggleShuffle, cx: &mut App| {
         let playback = Sonora::global(cx).playback.clone();
@@ -102,6 +136,27 @@ pub fn register(lingers: bool, cx: &mut App) {
     });
 
     cx.set_menus(menus());
+}
+
+/// Binds every key, with the shortcuts the user chose in settings, and binds them again whenever
+/// those choices change, from settings or from a hand edit of `settings.json`. The observer
+/// clears every binding first, so it rebuilds the fixed ones too.
+fn bind_keys(cx: &mut App) {
+    let settings = Sonora::global(cx).settings.clone();
+    let mut bound = settings.read(cx).keybinds().clone();
+    cx.bind_keys(input::bindings(&bound));
+    cx.observe(&settings, move |settings, cx| {
+        let chosen = settings.read(cx).keybinds();
+        if *chosen == bound {
+            return;
+        }
+        bound = chosen.clone();
+        cx.clear_key_bindings();
+        cx.bind_keys(input::bindings(&bound));
+        // the macOS menu bar reads its key equivalents when the menus are set
+        cx.set_menus(menus());
+    })
+    .detach();
 }
 
 /// The menu bar. Only macOS draws one, so only macOS gets the Edit and Window menus and the
@@ -137,9 +192,9 @@ fn menus() -> Vec<Menu> {
             name: t!("app-edit"),
             disabled: false,
             items: vec![
-                MenuItem::os_action(t!("app-cut"), Cut, OsAction::Cut),
-                MenuItem::os_action(t!("app-copy"), Copy, OsAction::Copy),
-                MenuItem::os_action(t!("app-paste"), Paste, OsAction::Paste),
+                MenuItem::os_action(t!("common-cut"), Cut, OsAction::Cut),
+                MenuItem::os_action(t!("common-copy"), Copy, OsAction::Copy),
+                MenuItem::os_action(t!("common-paste"), Paste, OsAction::Paste),
                 MenuItem::os_action(t!("app-select-all"), SelectAll, OsAction::SelectAll),
             ],
         });
@@ -154,6 +209,18 @@ fn menus() -> Vec<Menu> {
         });
     }
     menus
+}
+
+/// Turns the volume by `steps` notches, the same step the volume wheel takes.
+fn nudge_volume(cx: &mut App, steps: i8) {
+    let playback = Sonora::global(cx).playback.clone();
+    playback.update(cx, |playback, cx| playback.nudge_volume(steps, cx));
+}
+
+/// Moves 5 seconds forward or back through the track, the same step as the media keys.
+fn skip(cx: &mut App, forward: bool) {
+    let playback = Sonora::global(cx).playback.clone();
+    playback.update(cx, |playback, cx| playback.skip(forward, cx));
 }
 
 /// Runs `edit` on the equalizer while its screen is the one shown, the only place undo applies.

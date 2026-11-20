@@ -4,7 +4,7 @@ use gpui::{
     AnyElement, App, Context, Div, Hsla, Pixels, SharedString, Window, div, px, relative, svg,
 };
 use i18n::t;
-use state::SYSTEM_FONT;
+use state::{PageWidth, SYSTEM_FONT};
 use ui::{
     ActiveTheme as _, Button, Look, MAX_FONT, MAX_TRANSPARENCY, MIN_FONT, MenuItem, OptionCard,
     Picker, Rounding, Scrubber, Switch, Theme, ThemeKind,
@@ -24,21 +24,24 @@ const TYPEFACE_LEAD: usize = 2;
 const TYPEFACE_GUESS: usize = 24;
 /// How many faces are loaded a frame.
 const TYPEFACE_BATCH: usize = 3;
+/// The share of a thumbnail's width the centred page takes, leaving a margin either side.
+const CENTRED_SHARE: f32 = 0.6;
 
 impl SettingsView {
-    pub(super) fn appearance_groups(&self) -> Vec<Group> {
+    pub(super) fn appearance_groups(&self, cx: &App) -> Vec<Group> {
         vec![
             Group::new("settings-theme", "icons/palette.svg")
                 .cards(Slot::Theme)
                 .rows([Slot::Adaptive, Slot::CommunityThemes]),
             Group::new("settings-icons", "icons/layout-grid.svg").cards(Slot::Icons),
             Group::new("settings-corners", "icons/maximize.svg").cards(Slot::Corners),
+            Group::new("settings-page-width", "icons/columns-3.svg").cards(Slot::PageWidth),
             Group::new("settings-group-text", "icons/text-select.svg")
                 .rows([Slot::Typeface, Slot::Font]),
             Group::new("settings-group-window", "icons/panel-left-open.svg").rows(
                 [Slot::Opacity]
                     .into_iter()
-                    .chain(ui::WINDOW_BLUR.then_some(Slot::WindowBlur))
+                    .chain(ui::WindowBlur::supported(cx).then_some(Slot::WindowBlur))
                     .chain([Slot::Blur]),
             ),
         ]
@@ -234,11 +237,12 @@ impl SettingsView {
     }
 
     /// Asks the platform to blur the desktop behind a see-through window. It needs something to
-    /// show through, so the switch is off and disabled while the window is opaque.
+    /// show through, so the switch is off and disabled while the window is opaque, unless the
+    /// compositor can make the window see-through on its own.
     pub(super) fn blur_window_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let look = self.look(cx);
         let overrides = self.settings.read(cx).theme_overrides();
-        let opaque = !look.transparent;
+        let opaque = !look.transparent && !ui::COMPOSITOR_OPACITY;
 
         self.row(
             t!("settings-blur-window"),
@@ -299,7 +303,7 @@ impl SettingsView {
             .child(step("font-smaller", "−", "settings-font-smaller", -1.))
             .child(ui::spoken(
                 "settings-font-value",
-                t!("settings-font-value", size = look.font.round() as i64),
+                t!("unit-px", value = look.font.round() as i64),
             ))
             .child(step("font-larger", "+", "settings-font-larger", 1.));
 
@@ -365,6 +369,42 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// Two option cards, Centered and Wide. Each thumbnail is a window's content area with a page
+    /// drawn in it at the width that layout gives. The choice is saved on `AppSettings`, and
+    /// `Chrome::page` reads it when the pages draw.
+    pub(super) fn page_width_cards(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let chosen = self.settings.read(cx).page_width();
+        let rounding = self.look(cx).rounding;
+        let height = cx.theme().metrics.list_row * 1.6;
+        let count = PageWidth::ALL.len();
+
+        grid(count as u16, window, cx)
+            .children(
+                PageWidth::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(place, width)| {
+                        OptionCard::new(SharedString::from(format!("page-width-{}", width.id())))
+                            .choice(
+                                i18n::lookup(width.key(), None),
+                                width == chosen,
+                                place,
+                                count,
+                            )
+                            .thumb_height(height)
+                            .thumb(page_sketch(width, rounding, cx))
+                            .label(i18n::lookup(width.key(), None))
+                            .selected(width == chosen)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings
+                                    .update(cx, |settings, cx| settings.set_page_width(width, cx));
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn opacity_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let look = self.look(cx);
@@ -389,7 +429,7 @@ impl SettingsView {
                     .child(
                         Scrubber::new(&self.opacity, value)
                             .name(t!("settings-opacity"))
-                            .value(t!("settings-opacity-value", percent = percent))
+                            .value(t!("unit-percent", value = percent))
                             .colors(theme.progress_bar, theme.muted, theme.foreground)
                             .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
                                 let transparency = (1. - *fraction) * MAX_TRANSPARENCY;
@@ -413,7 +453,7 @@ impl SettingsView {
             .child(
                 ui::spoken(
                     "settings-opacity-value",
-                    t!("settings-opacity-value", percent = percent),
+                    t!("unit-percent", value = percent),
                 )
                 .flex_none()
                 .w(theme.metrics.control * 1.5)
@@ -509,6 +549,29 @@ pub(super) fn corner(rounding: Rounding, cx: &App) -> Div {
             .left(relative(0.25))
             .w_full()
             .h_full()
+            .rounded(rounding.radius())
+            .border_2()
+            .border_color(theme.muted_foreground)
+            .bg(theme.secondary),
+    )
+}
+
+/// A thumbnail of a wide window's content area with a page drawn across it. The centred page
+/// takes `CENTRED_SHARE` of the width and stands in the middle, the wide page takes all of it.
+fn page_sketch(width: PageWidth, rounding: Rounding, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (share, left) = match width {
+        PageWidth::Centered => (CENTRED_SHARE, (1. - CENTRED_SHARE) / 2.),
+        PageWidth::Wide => (1., 0.),
+    };
+
+    div().size_full().relative().child(
+        div()
+            .absolute()
+            .top(relative(0.2))
+            .bottom(relative(0.2))
+            .left(relative(left))
+            .w(relative(share))
             .rounded(rounding.radius())
             .border_2()
             .border_color(theme.muted_foreground)

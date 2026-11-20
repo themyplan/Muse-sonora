@@ -3,7 +3,7 @@
 //! account — profile, favorites, playlists — plus the `media.deezer.com/v1/get_url` call that
 //! hands out the encrypted stream urls.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -15,17 +15,19 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 use crate::cover::{self, CoverLimits};
-use crate::deezer::{decrypt, wire};
+use crate::deezer::{auth, decrypt, wire};
 use crate::engine::Loudness;
 use crate::{
-    Album, AlbumCatalogue, AlbumDetail, Artist, ArtistProfile, ArtistRef, Encoding, Genre,
-    GenreDetail, GenreItem, GenreSection, HomeFeed, MediaKind, MusicApi, Offer, Playlist,
+    AccountChoice, Album, AlbumCatalogue, AlbumDetail, Artist, ArtistProfile, ArtistRef, Encoding,
+    Genre, GenreDetail, GenreItem, GenreSection, HomeFeed, MediaKind, MusicApi, Offer, Playlist,
     PlaylistDetail, Quality, SUGGESTIONS, SavedArtist, Track, UserProfile, distinct_covers, escape,
 };
 
 const GATEWAY: &str = "https://www.deezer.com/ajax/gw-light.php";
 const PUBLIC: &str = "https://api.deezer.com";
 const MEDIA: &str = "https://media.deezer.com/v1/get_url";
+/// The cookie the web player sets to the family profile picked after `user.loginMulti`.
+const FAMILY_COOKIE: &str = "familyUserId";
 /// Trades the `arl` cookie for the short-lived bearer token the newer Deezer hosts take.
 const ARL_LOGIN: &str = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 /// Where the web app uploads a playlist picture, answering a token that names it.
@@ -44,11 +46,20 @@ const RESET_PICTURE: &str = "mutation ResetDefaultPlaylistCover($input: ResetDef
     ... on ResetDefaultPlaylistCoverMutationOutput { playlist { id } } \
     ... on ResetDefaultPlaylistCoverMutationError { playlistNotFound userIsNotPlaylistOwner isLovedTracksPlaylist } } }";
 
-/// The audio formats `get_url` knows, best first. The license decides which ones come back.
-const FORMATS: [&str; 3] = ["FLAC", "MP3_320", "MP3_128"];
+/// The audio formats `get_url` knows, best first. The license decides which ones come back, and
+/// a track never mastered in hi-res answers no url for `FLAC_24`, so the next format is tried.
+const FORMATS: [&str; 4] = ["FLAC_24", "FLAC", "MP3_320", "MP3_128"];
 
 /// The levels Deezer serves, best first, one for each of `FORMATS`.
 pub(crate) const QUALITIES: &[Offer] = &[
+    Offer {
+        quality: Quality::HiRes,
+        encoding: Encoding::Flac {
+            depth: 24,
+            rate: 192_000,
+        },
+        up_to: true,
+    },
     Offer {
         quality: Quality::Lossless,
         encoding: Encoding::Flac {
@@ -152,9 +163,15 @@ impl std::error::Error for Busy {}
 
 /// The account-scoped half of the handshake `deezer.getUserData` answers.
 struct Session {
+    /// The `arl` cookie the session runs on. Switching to a family profile can hand out a new
+    /// one, which replaces it.
+    arl: String,
     /// The `sid` session cookie `deezer.ping` hands out; the `checkForm` token is bound to
     /// it, so every gateway call has to carry both.
     sid: String,
+    /// Every other cookie the gateway has set, sent back on each call the way a browser would.
+    /// It also holds `familyUserId`, which names the family profile the session goes on as.
+    jar: BTreeMap<String, String>,
     profile: UserProfile,
     /// The `checkForm` token every later gateway call carries.
     api_token: String,
@@ -162,6 +179,23 @@ struct Session {
     /// Where in `FORMATS` the best format the plan covers sits. It stays 0, every format, when
     /// the account says nothing about its plan.
     plan: usize,
+    /// Whether the account belongs to a family plan, whose other profiles it can switch to.
+    family: bool,
+}
+
+impl Session {
+    /// The `Cookie` header a gateway call carries: the arl, the sid once there is one, and
+    /// everything in the jar.
+    fn cookies(&self) -> String {
+        let mut header = format!("arl={}", self.arl);
+        if !self.sid.is_empty() {
+            header.push_str(&format!("; sid={}", self.sid));
+        }
+        for (name, value) in &self.jar {
+            header.push_str(&format!("; {name}={value}"));
+        }
+        header
+    }
 }
 
 #[derive(Clone)]
@@ -171,7 +205,6 @@ pub struct DeezerClient {
 
 struct Inner {
     http: reqwest::Client,
-    arl: String,
     session: RwLock<Session>,
     /// The master stream secret, fetched once from the web player bundle at connect time.
     secret: OnceLock<decrypt::Secret>,
@@ -203,13 +236,20 @@ pub struct Opened {
 
 impl DeezerClient {
     /// Signs in with an `arl` cookie: fetches the user data (which validates the cookie) and
-    /// the stream secret. An invalid or expired arl answers a user id of 0.
-    pub async fn connect(arl: &str) -> Result<Self> {
+    /// the stream secret. An invalid or expired arl answers a user id of 0. With a `profile`,
+    /// the session then switches to that family profile and fails if it cannot.
+    pub async fn connect(arl: &str, profile: Option<&str>) -> Result<Self> {
         let client = Self::unopened(arl)?;
+        if let Some(profile) = profile {
+            client.remember_member(profile).await;
+        }
         client.ping().await?;
         client.refresh().await?;
         if client.inner.session.read().await.profile.id.is_empty() {
             bail!("the arl was refused; sign in to deezer.com again");
+        }
+        if let Some(profile) = profile {
+            client.switch(profile).await?;
         }
         let secret = decrypt::secret(&client.inner.http).await;
         // set once here, before the client is cloned anywhere
@@ -233,9 +273,10 @@ impl DeezerClient {
         let client = Self {
             inner: Arc::new(Inner {
                 http,
-                arl: arl.to_owned(),
                 session: RwLock::new(Session {
+                    arl: arl.to_owned(),
                     sid: String::new(),
+                    jar: BTreeMap::new(),
                     profile: UserProfile {
                         id: String::new(),
                         display_name: String::new(),
@@ -244,6 +285,7 @@ impl DeezerClient {
                     api_token: String::new(),
                     license_token: String::new(),
                     plan: 0,
+                    family: false,
                 }),
                 secret: OnceLock::new(),
                 slot: Mutex::new(Instant::now()),
@@ -259,14 +301,17 @@ impl DeezerClient {
     /// error, because the `checkForm` token is bound to that session.
     async fn ping(&self) -> Result<()> {
         let url = format!("{GATEWAY}?method=deezer.ping&input=3&api_version=1.0&api_token=");
-        let text = self
+        let cookies = self.inner.session.read().await.cookies();
+        let response = self
             .inner
             .http
             .get(url)
-            .header("Cookie", format!("arl={}", self.inner.arl))
+            .header("Cookie", cookies)
             .send()
             .await
-            .context("cannot reach the deezer gateway for deezer.ping")?
+            .context("cannot reach the deezer gateway for deezer.ping")?;
+        self.adopt_cookies(response.headers()).await;
+        let text = response
             .text()
             .await
             .context("cannot read the deezer gateway answer")?;
@@ -291,11 +336,84 @@ impl DeezerClient {
             .unwrap_or_default()
             .to_owned();
         let plan = plan(&user["OPTIONS"]);
+        let family = wire::truthy(&user["MULTI_ACCOUNT"], &["ENABLED"]);
         let mut session = self.inner.session.write().await;
         session.profile = profile;
         session.api_token = api_token;
         session.license_token = license_token;
         session.plan = plan;
+        session.family = family;
+        Ok(())
+    }
+
+    /// The `arl` the session runs on now, which is the one to store after a profile switch.
+    pub async fn arl(&self) -> String {
+        self.inner.session.read().await.arl.clone()
+    }
+
+    /// The family profiles this session can switch to, the signed-in one among them, in
+    /// Deezer's order. Empty when the account has no family plan, and an error when it has one
+    /// but the list cannot be read.
+    pub async fn profiles(&self) -> Result<Vec<AccountChoice>> {
+        let (family, current) = {
+            let session = self.inner.session.read().await;
+            (session.family, session.profile.clone())
+        };
+        if !family {
+            return Ok(Vec::new());
+        }
+        let results = self
+            .gw("deezer.getChildAccounts", json!({}))
+            .await
+            .context("cannot list the deezer family profiles")?;
+        let members = results
+            .as_array()
+            .or_else(|| results["data"].as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut profiles: Vec<AccountChoice> = members
+            .iter()
+            .filter(|member| wire::truthy(&member["EXTRA_FAMILY"], &["IS_LOGGABLE_AS"]))
+            .filter_map(wire::family_profile)
+            .collect();
+        if !profiles.iter().any(|profile| profile.id == current.id) {
+            profiles.insert(
+                0,
+                AccountChoice {
+                    id: current.id,
+                    name: current.display_name,
+                    detail: None,
+                },
+            );
+        }
+        Ok(profiles)
+    }
+
+    /// Moves the session to the family profile `id` the way the web player does, then reloads
+    /// the user data so every later call acts as that profile. Fails when Deezer refuses or
+    /// still answers as someone else afterwards. Switching to the signed-in profile does nothing.
+    pub async fn switch(&self, id: &str) -> Result<()> {
+        if self.user_id().await == id {
+            self.remember_member(id).await;
+            return Ok(());
+        }
+        let account = id
+            .parse::<u64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::from(id));
+        self.gw("user.loginMulti", json!({ "account_id": account }))
+            .await
+            .context("cannot switch to that deezer profile")?;
+        self.remember_member(id).await;
+        if let Err(error) = self.gw("deezer.userAutolog", json!({})).await {
+            log::debug!("deezer: userAutolog after a profile switch failed: {error:#}");
+        }
+        self.refresh().await?;
+        let now = self.user_id().await;
+        if now != id {
+            bail!("deezer still answers as profile {now} after switching to {id}");
+        }
+        log::info!("deezer: switched to family profile {id}");
         Ok(())
     }
 
@@ -311,14 +429,27 @@ impl DeezerClient {
         self.inner.session.read().await.profile.id.clone()
     }
 
+    /// Sets the `familyUserId` cookie the web player keeps for the picked family profile. The
+    /// gateway reads it when it logs a session in from the `arl`, which would otherwise answer
+    /// as the account owner.
+    async fn remember_member(&self, id: &str) {
+        self.inner
+            .session
+            .write()
+            .await
+            .jar
+            .insert(FAMILY_COOKIE.to_owned(), id.to_owned());
+    }
+
     /// A bearer token for `auth.deezer.com`'s newer hosts, minted from the `arl`. It lives a
     /// few minutes, so each use asks for a fresh one.
     async fn jwt(&self) -> Result<String> {
+        let arl = self.arl().await;
         let answer: Value = self
             .inner
             .http
             .post(ARL_LOGIN)
-            .header("Cookie", format!("arl={}", self.inner.arl))
+            .header("Cookie", format!("arl={arl}"))
             .header("Accept", "application/json")
             .header("Content-Length", "0")
             .send()
@@ -415,7 +546,8 @@ impl DeezerClient {
 
     /// One gateway round trip: POST JSON to `gw-light.php` with the `arl` and `sid` cookies.
     /// The gateway answers HTTP 200 to almost everything, so the `error` field is what
-    /// actually decides.
+    /// actually decides. A new `arl` or `sid` the answer sets replaces the old one, the way a
+    /// browser would keep it.
     async fn gw_raw(&self, method: &str, api_token: &str, body: Value) -> Result<Value> {
         let cid = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -426,17 +558,19 @@ impl DeezerClient {
             escape::component(method),
             escape::component(api_token)
         );
-        let sid = self.inner.session.read().await.sid.clone();
-        let text = self
+        let cookies = self.inner.session.read().await.cookies();
+        let response = self
             .inner
             .http
             .post(url)
-            .header("Cookie", format!("arl={}; sid={sid}", self.inner.arl))
+            .header("Cookie", cookies)
             .header("Content-Type", "text/plain;charset=UTF-8")
             .body(body.to_string())
             .send()
             .await
-            .with_context(|| format!("cannot reach the deezer gateway for {method}"))?
+            .with_context(|| format!("cannot reach the deezer gateway for {method}"))?;
+        self.adopt_cookies(response.headers()).await;
+        let text = response
             .text()
             .await
             .context("cannot read the deezer gateway answer")?;
@@ -453,6 +587,68 @@ impl DeezerClient {
             }
         }
         Ok(answer.get("results").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Takes the cookies a gateway answer sets, so the calls after it carry them the way a
+    /// browser would. A new arl also replaces the stored one when that one belongs to this
+    /// session. An arl that does not look like one, such as a deleted cookie, is ignored.
+    async fn adopt_cookies(&self, headers: &reqwest::header::HeaderMap) {
+        let mut arl = None;
+        let mut sid = None;
+        let mut others = Vec::new();
+        for header in headers.get_all(reqwest::header::SET_COOKIE) {
+            let Some(cookie) = header.to_str().ok() else {
+                continue;
+            };
+            let mut parts = cookie.split(';');
+            let Some((name, value)) = parts.next().and_then(|pair| pair.split_once('=')) else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim());
+            let expired = value.is_empty()
+                || value == "deleted"
+                || parts.any(|attribute| {
+                    attribute
+                        .trim()
+                        .to_ascii_lowercase()
+                        .strip_prefix("max-age=")
+                        .is_some_and(|age| age.trim().starts_with(['0', '-']))
+                });
+            match name {
+                "arl" => arl = auth::arl(value).ok(),
+                "sid" if !expired => sid = Some(value.to_owned()),
+                "sid" => {}
+                _ => others.push((name.to_owned(), (!expired).then(|| value.to_owned()))),
+            }
+        }
+        if arl.is_none() && sid.is_none() && others.is_empty() {
+            return;
+        }
+        let mut session = self.inner.session.write().await;
+        for (name, value) in others {
+            match value {
+                Some(value) => session.jar.insert(name, value),
+                None => session.jar.remove(&name),
+            };
+        }
+        if let Some(arl) = arl
+            && arl != session.arl
+        {
+            log::debug!("deezer: the gateway handed out a new arl");
+            if let Some(stored) = auth::load()
+                && stored.arl == session.arl
+                && let Err(error) = auth::store(&auth::Credentials {
+                    arl: arl.clone(),
+                    profile: stored.profile,
+                })
+            {
+                log::warn!("deezer: cannot store the renewed session: {error:#}");
+            }
+            session.arl = arl;
+        }
+        if let Some(sid) = sid {
+            session.sid = sid;
+        }
     }
 
     /// A public REST call, paced to the api's quota and asked again with a growing wait
@@ -867,6 +1063,7 @@ impl MusicApi for DeezerClient {
                 .unwrap_or_default()
                 .to_owned(),
             id: Some(artist_id.to_owned()),
+            channel: false,
         };
         Ok(Artist {
             name: own.name.clone(),
@@ -878,6 +1075,7 @@ impl MusicApi for DeezerClient {
             banner: None,
             biography: None,
             monthly_listeners: wire::number(&detail, &["nb_fan"]),
+            followers: None,
             top_tracks: top.map(|page| wire::track_list(&page)).unwrap_or_default(),
             albums: albums
                 .map(|page| {
@@ -1249,6 +1447,7 @@ impl MusicApi for DeezerClient {
                 .and_then(|detail| wire::text(&detail, &["name"]).map(str::to_owned))
                 .unwrap_or_default(),
             id: Some(artist_id.to_owned()),
+            channel: false,
         };
         // Nothing read at all is an error rather than an empty rail, so the catalog does not
         // keep the empty answer for the rest of the session.
@@ -1281,6 +1480,7 @@ impl MusicApi for DeezerClient {
                         let theirs = ArtistRef {
                             name: artist.name.clone(),
                             id: Some(artist.id.clone()),
+                            channel: false,
                         };
                         for album in releases.into_iter().take(SIMILAR_RELEASES) {
                             if liked.len() >= SUGGESTIONS {
@@ -1478,7 +1678,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Where in `FORMATS` the best format a plan covers sits, from the `OPTIONS` of
 /// `deezer.getUserData`. A level the options do not mention counts as covered, so an account
-/// that says nothing about its plan is asked for every format.
+/// that says nothing about its plan is asked for every format. Deezer has no hi-res flag, since a
+/// lossless plan is licensed for `FLAC_24` too.
 fn plan(options: &Value) -> usize {
     let covers = |keys: [&str; 2]| {
         let flags = keys
@@ -1493,17 +1694,18 @@ fn plan(options: &Value) -> usize {
         covers(["web_hq", "mobile_hq"]),
     ) {
         (true, _) => 0,
-        (false, true) => 1,
-        (false, false) => 2,
+        (false, true) => 2,
+        (false, false) => 3,
     }
 }
 
 /// The formats to try for a level, from its own down to the lowest.
 fn formats_from(quality: Quality) -> &'static [&'static str] {
     let first = match quality.within(QUALITIES) {
-        Quality::HiRes | Quality::Lossless => 0,
-        Quality::High => 1,
-        Quality::Normal | Quality::Low => 2,
+        Quality::HiRes => 0,
+        Quality::Lossless => 1,
+        Quality::High => 2,
+        Quality::Normal | Quality::Low => 3,
     };
     &FORMATS[first..]
 }

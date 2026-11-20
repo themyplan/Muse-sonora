@@ -12,8 +12,8 @@ use state::{
     AppSettings, Equalizer, Outputs, RuleDevice, Signal, Sonora, Sound, equalizer_profile_label,
 };
 use ui::{
-    ActiveTheme as _, Button, Dismiss, FORM_CONTEXT, Input, Lazy, MenuItem, Modal, Picker,
-    Popovers, Room, Scrollbar, Scrubber, ScrubberState, Submit, Switch, TabBar,
+    ActiveTheme as _, Button, Dismiss, FORM_CONTEXT, Field, Form, Input, Lazy, MenuItem, Modal,
+    Picker, Popovers, Room, Scrollbar, Scrubber, ScrubberState, Submit, Switch, TabBar,
 };
 
 use crate::chrome::Chrome;
@@ -530,7 +530,7 @@ impl EqualizerView {
             .items_center()
             .gap_1()
             .child(
-                action("equalizer-undo", "icons/undo-2.svg", "equalizer-undo")
+                action("equalizer-undo", "icons/undo-2.svg", "common-undo")
                     .disabled(!undo)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.equalizer
@@ -538,7 +538,7 @@ impl EqualizerView {
                     })),
             )
             .child(
-                action("equalizer-redo", "icons/redo-2.svg", "equalizer-redo")
+                action("equalizer-redo", "icons/redo-2.svg", "common-redo")
                     .disabled(!redo)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.equalizer
@@ -614,7 +614,8 @@ impl EqualizerView {
             .child(card(&view, "equalizer-filters", |this, window, cx| {
                 let row = settings::Layout::of(window, cx).room();
                 let filters = this.filters(row.fits(Room::Roomy), cx);
-                form(filters, cx).into_any_element()
+                let fields = this.filter_focus(cx);
+                form("equalizer-filters-form", filters, fields, cx).into_any_element()
             }))
             .child(card(&view, "equalizer-rules", |this, _, cx| this.rules(cx)))
             .child(card(&view, "equalizer-transfer", |this, _, cx| {
@@ -666,7 +667,7 @@ impl EqualizerView {
             .child(
                 Scrubber::new(state, ((gain - low) / (high - low)) as f32)
                     .name(title.clone())
-                    .value(t!("equalizer-decibels-value", db = signed.clone()))
+                    .value(t!("unit-db", value = signed.clone()))
                     .colors(theme.muted, theme.muted, theme.foreground)
                     .on_move(cx.listener(move |this, fraction: &f32, _, cx| {
                         let gain = tone_gain(*fraction);
@@ -678,7 +679,7 @@ impl EqualizerView {
         let value = Button::new(reset)
             .small()
             .w(theme.metrics.cover * TONE_VALUE)
-            .label(t!("equalizer-decibels-value", db = signed))
+            .label(t!("unit-db", value = signed))
             .tooltip("equalizer-tone-reset")
             .disabled(gain == 0.)
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -726,7 +727,7 @@ impl EqualizerView {
                     .on_click(cx.listener(move |this, _, _, cx| this.set_preamp(choice, cx)))
             }),
         );
-        let level = t!("equalizer-decibels-value", db = figure(resolved, 1));
+        let level = t!("unit-db", value = figure(resolved, 1));
         let value = match auto {
             true => figure_cell(
                 "equalizer-preamp-value",
@@ -752,7 +753,14 @@ impl EqualizerView {
             .child(value)
             .into_any_element();
 
-        form(Row::new(t!("equalizer-preamp"), controls), cx).into_any_element()
+        let preamp = vec![self.preamp.read(cx).focus_handle(cx)];
+        form(
+            "equalizer-preamp-form",
+            Row::new(t!("equalizer-preamp"), controls),
+            preamp,
+            cx,
+        )
+        .into_any_element()
     }
 
     /// The dialog that names a profile, titled for saving or renaming.
@@ -764,7 +772,7 @@ impl EqualizerView {
         let theme = *cx.theme();
         let modal = Modal::new("equalizer-name-dialog", title)
             .w(theme.metrics.cover * DIALOG)
-            .child(self.name.clone())
+            .child(Form::new("equalizer-name-form").field(Field::new(&self.name, cx)))
             .action(
                 Button::new("equalizer-name-cancel")
                     .ghost()
@@ -886,20 +894,19 @@ fn heading(
         .children(action)
 }
 
-/// Gives `content` the form keys of the number fields in it: Enter commits the focused field and
-/// Escape puts it back.
-fn form(content: impl IntoElement, cx: &mut Context<EqualizerView>) -> Div {
-    div()
-        .key_context(FORM_CONTEXT)
-        .on_action(cx.listener(|this, _: &Submit, window, cx| {
-            cx.stop_propagation();
-            this.submit(window, cx);
-        }))
-        .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
-            cx.stop_propagation();
-            this.revert(window, cx);
-        }))
+/// Gives `content` the form keys of the number fields in it: Enter commits the focused field,
+/// Escape puts it back and Tab moves along `fields`, committing the one it leaves.
+fn form(
+    id: &'static str,
+    content: impl IntoElement,
+    fields: Vec<FocusHandle>,
+    cx: &mut Context<EqualizerView>,
+) -> Form {
+    Form::new(id)
+        .placed(fields)
         .child(content)
+        .on_submit(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+        .on_dismiss(cx.listener(|this, _, window, cx| this.revert(window, cx)))
 }
 
 /// An advanced group that is built and laid out only while it is on screen, so scrolling the

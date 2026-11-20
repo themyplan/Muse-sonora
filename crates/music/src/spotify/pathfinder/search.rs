@@ -329,6 +329,7 @@ fn playlist(hit: PlaylistHit, username: &str) -> Option<Playlist> {
             .and_then(|artwork| cover(&artwork.sources, false)),
         track_count: 0,
         modified_at: None,
+        read_only: false,
     })
 }
 
@@ -340,6 +341,7 @@ fn credits(artists: Artists) -> (String, Vec<ArtistRef>) {
             Some(ArtistRef {
                 name: artist.profile.map(|profile| profile.name)?,
                 id: trimmed(&artist.uri, ARTIST_PREFIX),
+                channel: false,
             })
         })
         .collect();

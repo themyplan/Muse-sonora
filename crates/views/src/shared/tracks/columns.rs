@@ -11,7 +11,9 @@ pub(crate) enum TrackField {
     Title,
     Artists,
     Album,
+    Genre,
     AddedAt,
+    LikedAt,
     AddedBy,
     PlayedAt,
     Plays,
@@ -21,6 +23,7 @@ pub(crate) enum TrackField {
 const LENGTH: Pixels = px(84.);
 const CREDITED: Pixels = px(144.);
 const CONTRIBUTOR: Pixels = px(168.);
+const FILED: Pixels = px(132.);
 const ALBUM_LENGTH: Pixels = px(120.);
 const ALBUM_PLAYS: Pixels = px(108.);
 
@@ -57,6 +60,18 @@ const ALBUM: ColumnSpec<TrackField> = ColumnSpec {
     ..COLUMN
 };
 
+/// The genres a track is filed under, shown once the listener turns the column on. It ranks with
+/// the album and sits after it, so a narrow table drops the genres first.
+const GENRE: ColumnSpec<TrackField> = ColumnSpec {
+    field: TrackField::Genre,
+    key: "genre",
+    header: "column-genre",
+    width: Width::Fixed(FILED),
+    rank: SPARE,
+    optional: true,
+    ..COLUMN
+};
+
 const ADDED_AT: ColumnSpec<TrackField> = ColumnSpec {
     field: TrackField::AddedAt,
     key: "added-at",
@@ -65,6 +80,16 @@ const ADDED_AT: ColumnSpec<TrackField> = ColumnSpec {
     rank: NICE,
     first: Sort::Descending,
     ..COLUMN
+};
+
+/// The day a favorite was made, for a shelf that lists its whole catalog and so dates each row by
+/// when it joined. It stays off until the listener turns it on, and sorts from the sort menu.
+const LIKED_AT: ColumnSpec<TrackField> = ColumnSpec {
+    field: TrackField::LikedAt,
+    key: "liked-at",
+    header: "column-date-liked",
+    optional: true,
+    ..ADDED_AT
 };
 
 const ADDED_BY: ColumnSpec<TrackField> = ColumnSpec {
@@ -129,17 +154,33 @@ const ALBUM_DURATION: ColumnSpec<TrackField> = ColumnSpec {
     ..DURATION
 };
 
-pub(crate) const LIBRARY_COLUMNS: &[ColumnSpec<TrackField>] =
-    &[INDEX, COVER, TITLE, ARTISTS, ALBUM, ADDED_AT, DURATION];
+pub(crate) const LIBRARY_COLUMNS: &[ColumnSpec<TrackField>] = &[
+    INDEX, COVER, TITLE, ARTISTS, ALBUM, GENRE, ADDED_AT, DURATION,
+];
 
-pub(crate) const PLAYLIST_COLUMNS_SHARED: &[ColumnSpec<TrackField>] =
-    &[INDEX, COVER, TITLE, ARTISTS, ALBUM, CREDITED_AT, DURATION];
+/// The songs of the library page, which alone can date the favorites apart from the catalog.
+pub(crate) const SONGS_COLUMNS: &[ColumnSpec<TrackField>] = &[
+    INDEX, COVER, TITLE, ARTISTS, ALBUM, GENRE, ADDED_AT, LIKED_AT, DURATION,
+];
 
-pub(crate) const PLAYLIST_COLUMNS_BLEND: &[ColumnSpec<TrackField>] =
-    &[INDEX, COVER, TITLE, ARTISTS, ALBUM, ADDED_BY, DURATION];
+pub(crate) const PLAYLIST_COLUMNS_SHARED: &[ColumnSpec<TrackField>] = &[
+    INDEX,
+    COVER,
+    TITLE,
+    ARTISTS,
+    ALBUM,
+    GENRE,
+    CREDITED_AT,
+    DURATION,
+];
 
-pub(crate) const HISTORY_COLUMNS: &[ColumnSpec<TrackField>] =
-    &[INDEX, COVER, TITLE, ARTISTS, ALBUM, PLAYED_AT, DURATION];
+pub(crate) const PLAYLIST_COLUMNS_BLEND: &[ColumnSpec<TrackField>] = &[
+    INDEX, COVER, TITLE, ARTISTS, ALBUM, GENRE, ADDED_BY, DURATION,
+];
+
+pub(crate) const HISTORY_COLUMNS: &[ColumnSpec<TrackField>] = &[
+    INDEX, COVER, TITLE, ARTISTS, ALBUM, GENRE, PLAYED_AT, DURATION,
+];
 
 pub(crate) const ARTIST_COLUMNS: &[ColumnSpec<TrackField>] = &[
     INDEX,

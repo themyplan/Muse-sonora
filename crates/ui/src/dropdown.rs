@@ -8,6 +8,7 @@ use gpui::{
 };
 
 use crate::glass::{GLASS_BLUR, blurring, popover_fill};
+use crate::linger::Linger;
 use crate::motion::{Fading as _, Rising as _};
 use crate::theme::ActiveTheme as _;
 
@@ -19,10 +20,10 @@ const PRIORITY: usize = 1;
 type Close = Box<dyn Fn(&mut Window, &mut App) + 'static>;
 
 /// A field or control with a panel that hangs under it while `open`, as wide as it, floating
-/// over the content below in the look of a context menu. The panel takes no focus, so a field
-/// in the anchor keeps the keyboard. It comes in with a context menu's entrance each time it
-/// opens. A press anywhere outside both the anchor and the panel reaches `on_close`, and
-/// whether the panel shows is left to the caller.
+/// over the content below in the look of a context menu. The panel takes no focus, and a press
+/// on it holds the keyboard in a field in the anchor. It comes in with a context menu's entrance
+/// each time it opens. A press anywhere outside both the anchor and the panel reaches
+/// `on_close`, and whether the panel shows is left to the caller.
 #[derive(IntoElement)]
 pub struct Dropdown {
     base: Stateful<Div>,
@@ -94,23 +95,27 @@ impl RenderOnce for Dropdown {
             .text_color(theme.popover_foreground)
             .shadow_md()
             .occlude()
+            .capture_any_mouse_down(|_, window, cx| crate::input::keep_focus(window, cx))
             .children(children)
             .rising("dropdown-rise");
         // The entrance is a paint filter, which drops a backdrop inside it, so the frost is a
         // sibling under the panel fading in on the same curve, as a context menu does it.
-        let frosted = div()
-            .relative()
-            .when(blurring(cx), |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .rounded(theme.radius)
-                        .backdrop_blur(GLASS_BLUR)
-                        .fading("dropdown-frost"),
-                )
-            })
-            .child(panel);
+        let frosted = Linger::new(
+            "dropdown-linger",
+            div()
+                .relative()
+                .when(blurring(cx), |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded(theme.radius)
+                            .backdrop_blur(GLASS_BLUR)
+                            .fading("dropdown-frost"),
+                    )
+                })
+                .child(panel),
+        );
 
         base.relative()
             .child(anchor)

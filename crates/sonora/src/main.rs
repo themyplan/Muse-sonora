@@ -15,6 +15,8 @@ mod single;
 #[cfg(windows)]
 mod thumbbar;
 mod tray;
+#[cfg(windows)]
+mod window_title;
 #[cfg(target_os = "linux")]
 mod x11_icon;
 
@@ -40,8 +42,9 @@ const LEAST_SIZE: Size<Pixels> = size(px(480.), px(400.));
 const FIRST_SIZE: Size<Pixels> = size(px(920.), px(640.));
 /// Some file managers launch a fresh process per selected file instead of one with every path,
 /// so a multi-file "Open With" arrives here as several single-file hand-offs within milliseconds
-/// of each other. This is how long to wait for the burst to go quiet before acting on it, so
-/// they land as one batch instead of racing each other into the engine one at a time.
+/// of each other. The first one plays at once and the rest join its queue. This is how long the
+/// burst has to stay quiet before it's considered over, so every file lands in one queue
+/// instead of racing the others in.
 const OPEN_COALESCE: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
@@ -64,7 +67,7 @@ fn main() -> ExitCode {
     let args = std::env::args_os()
         .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"))
         .collect();
-    let command = cli::parse(args, state::VERSION);
+    let command = cli::parse(args, state::version());
     if !matches!(command, Ok(CommandType::Launch(_))) {
         console::attach();
     }
@@ -87,6 +90,10 @@ fn main() -> ExitCode {
         single::Instance::First => {}
         single::Instance::Running => return ExitCode::SUCCESS,
         single::Instance::Failed => exit(1),
+    }
+    // Only the instance that owns the socket may replace Sonora, never a hand-off to one that runs.
+    if state::start_staged(!args.is_empty()) {
+        return ExitCode::SUCCESS;
     }
     // reqwest is built without a crypto provider, and opensubsonic still compiles aws-lc-rs in
     // beside ring, so rustls cannot pick one by itself. Every client uses ring from here on. A
@@ -125,6 +132,7 @@ fn main() -> ExitCode {
             Arc::new(music::apple::AppleProvider::new()),
             Arc::new(music::youtube::YouTubeProvider::new()),
             Arc::new(music::subsonic::SubsonicProvider::new()),
+            Arc::new(music::jellyfin::JellyfinProvider::new()),
             Arc::new(music::deezer::DeezerProvider::new()),
             Arc::new(music::tidal::TidalProvider::new()),
         ];
@@ -139,6 +147,7 @@ fn main() -> ExitCode {
         let lyrics: Vec<Arc<dyn LyricsProvider>> = vec![
             Arc::new(music::local::LocalLyrics),
             Arc::new(music::subsonic::SubsonicLyrics::new()),
+            Arc::new(music::jellyfin::JellyfinLyrics::new()),
             Arc::new(music::spotify::SpotifyLyrics::from_env()),
             Arc::new(music::youtube::YouTubeLyrics::new()),
             Arc::new(music::binimum::Binimum::new()),
@@ -187,7 +196,7 @@ fn main() -> ExitCode {
         }
         ui::Theme::init(look, &overrides, cx);
 
-        let lingers = tray::install(show_window, cx);
+        let lingers = tray::install(show_window, toggle_window, cx);
         if lingers {
             cx.set_quit_mode(QuitMode::Explicit);
         }
@@ -229,12 +238,9 @@ fn main() -> ExitCode {
 
         cx.spawn(async move |cx| {
             let mut pending: Vec<String> = Vec::new();
-            loop {
-                match links.recv().await {
-                    Some(items) => pending.extend(items),
-                    None => break,
-                }
-                // Drain whatever else arrives in the same burst before acting on any of it.
+            while let Some(items) = links.recv().await {
+                // The first hand-off acts at once, the rest of the burst joins the queue.
+                cx.update(|cx| follow(&items, false, cx));
                 loop {
                     cx.background_executor().timer(OPEN_COALESCE).await;
                     let mut more = false;
@@ -245,9 +251,9 @@ fn main() -> ExitCode {
                     if !more {
                         break;
                     }
+                    let batch = std::mem::take(&mut pending);
+                    cx.update(|cx| follow(&batch, true, cx));
                 }
-                let batch = std::mem::take(&mut pending);
-                cx.update(|cx| follow(&batch, cx));
             }
         })
         .detach();
@@ -258,10 +264,13 @@ fn main() -> ExitCode {
 }
 
 /// Opens what a launch or a hand-off passed: a provider's link opens on that provider, and
-/// anything else is read as a file to play. An address no provider knows is refused with a
-/// toast rather than tried as a file.
-fn follow(items: &[String], cx: &mut App) {
-    show_window(cx);
+/// anything else is read as a file to play. The first batch of an open starts playing at once,
+/// later batches of the same open join its queue. An address no provider knows is refused with
+/// a toast rather than tried as a file.
+fn follow(items: &[String], tail: bool, cx: &mut App) {
+    if !tail {
+        show_window(cx);
+    }
     let links = Sonora::global(cx).links.clone();
     let mut paths: Vec<PathBuf> = Vec::new();
     for item in items {
@@ -273,9 +282,18 @@ fn follow(items: &[String], cx: &mut App) {
             false => paths.push(cli::item::local_path(item)),
         }
     }
+    if !tail
+        && !paths.is_empty()
+        && Sonora::global(cx)
+            .settings
+            .read(cx)
+            .now_playing_on_file_open()
+    {
+        router::navigate(Destination::Fullscreen, cx);
+    }
     if !paths.is_empty() {
         let playback = Sonora::global(cx).playback.clone();
-        playback.update(cx, |playback, cx| playback.open_paths(paths, cx));
+        playback.update(cx, |playback, cx| playback.open_paths(paths, tail, cx));
     }
 }
 
@@ -306,34 +324,64 @@ fn show_window(cx: &mut App) {
     cx.activate(true);
 }
 
+/// What a tray click does to the main window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAction {
+    Show,
+    Hide,
+}
+
+/// Shows the window when it is hidden, minimized or closed, and hides it when it is visible.
+fn toggle_window(cx: &mut App) {
+    let visible = cx
+        .windows()
+        .first()
+        .and_then(|window| window.update(cx, |_, window, _| window.is_visible()).ok());
+    match window_action(visible) {
+        WindowAction::Show => reveal_window(visible, cx),
+        WindowAction::Hide => hide_window(cx),
+    }
+}
+
+/// Brings the window back from the tray. Linux reopens a window that is there but hidden, since a
+/// Wayland compositor raises a window only for an activation token the tray never hands over.
+fn reveal_window(visible: Option<bool>, cx: &mut App) {
+    if cfg!(target_os = "linux") && visible == Some(false) {
+        hide_window(cx);
+    }
+    show_window(cx);
+}
+
+/// Linux closes the window into the tray, since a Wayland compositor may not minimize at all.
+#[cfg(target_os = "linux")]
+fn hide_window(cx: &mut App) {
+    actions::hide_to_tray(cx);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hide_window(cx: &mut App) {
+    if let Some(window) = cx.windows().first() {
+        window
+            .update(cx, |_, window, _| window.minimize_window())
+            .ok();
+    }
+}
+
+/// Picks the action from whether the window is visible, `None` when there is no window.
+fn window_action(visible: Option<bool>) -> WindowAction {
+    match visible {
+        Some(true) => WindowAction::Hide,
+        Some(false) | None => WindowAction::Show,
+    }
+}
+
 fn open_window(cx: &mut App) {
     let Sonora {
         session,
-        control: _,
-        cover: _,
-        devices: _,
-        downloads: _,
-        drm: _,
-        equalizer: _,
         library,
-        links: _,
-        listening: _,
-        history: _,
-        lyrics: _,
-        network: _,
-        outputs: _,
-        pins: _,
         playback,
-        potoken: _,
         queue,
-        requirements: _,
-        scan: _,
-        scrobbling: _,
-        settings: _,
-        signal: _,
-        updates: _,
-        usage: _,
-        wake: _,
+        ..
     } = Sonora::global(cx);
     let (session, library, playback, queue) = (
         session.clone(),
@@ -397,6 +445,8 @@ fn open_window(cx: &mut App) {
                 app_icon::install(handle);
                 thumbbar::install(window.window_handle().window_id(), handle, cx);
             }
+            #[cfg(windows)]
+            window_title::install(window.window_handle(), cx);
             state::remember_window(window, cx);
             cx.new(|cx| Root::new(session, library, playback, queue, window, cx))
         },
@@ -600,4 +650,20 @@ unsafe extern "system" fn work_area(
 #[cfg(not(target_os = "windows"))]
 fn platform_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_visible_window_is_hidden() {
+        assert_eq!(window_action(Some(true)), WindowAction::Hide);
+    }
+
+    #[test]
+    fn a_minimized_or_closed_window_is_shown() {
+        assert_eq!(window_action(Some(false)), WindowAction::Show);
+        assert_eq!(window_action(None), WindowAction::Show);
+    }
 }

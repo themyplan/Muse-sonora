@@ -222,6 +222,7 @@ impl MusicApi for YouTubeClient {
             artists: vec![ytmusic::ArtistRef {
                 name: author,
                 id: channel,
+                channel: false,
             }],
             album: None,
             duration: Some(std::time::Duration::from_secs(seconds)),
@@ -390,7 +391,9 @@ impl MusicApi for YouTubeClient {
     async fn playlist(&self, playlist_id: &str) -> Result<PlaylistDetail> {
         let mut detail = self.api.playlist_page(playlist_id).await?;
         detail.tracks = self.api.swap_playable(detail.tracks).await;
-        Ok(wire::playlist_detail(detail))
+        let mut detail = wire::playlist_detail(detail);
+        name_owned_playlist(&mut detail.playlist, &self.account);
+        Ok(detail)
     }
 
     async fn playlist_continuation(
@@ -508,15 +511,144 @@ fn collect_thumbnails(node: &serde_json::Value) -> Vec<ytmusic::Thumbnail> {
 }
 
 /// A playlist of the library as Sonora lists it: one the user made is theirs by name, and the
-/// saved-episodes list YouTube keeps for podcasts is left out.
+/// saved-episodes list YouTube keeps for podcasts is left out. A playlist made before the
+/// account had a channel comes back with no author and no delete action, while a playlist
+/// saved from someone else always names its author, so a missing author marks it as owned.
 pub(crate) fn library_playlist(source: ytmusic::Playlist, account: &str) -> Option<Playlist> {
     if source.id == EPISODES {
         return None;
     }
     let mut playlist = wire::playlist(source, false, false);
-    if playlist.owned && playlist.owner.is_empty() {
+    if playlist.owner.is_empty() {
+        playlist.owned = true;
         playlist.owner = account.to_owned();
     }
 
     Some(playlist)
+}
+
+/// Names an owned playlist after the account, as the library listing does. YouTube leaves the
+/// author out of an owned playlist's page, so without this its creator line vanishes once the
+/// page loads. A playlist that is not the listener's keeps whatever author the page names.
+fn name_owned_playlist(playlist: &mut Playlist, account: &str) {
+    if playlist.owned && playlist.owner.is_empty() {
+        playlist.owner = account.to_owned();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use ytmusic::parse;
+
+    use super::*;
+
+    /// A library grid tile the way YouTube Music sends it, with the given subtitle texts and
+    /// the icons of its menu actions.
+    fn tile(id: &str, subtitle: &[&str], icons: &[&str]) -> Value {
+        let runs: Vec<Value> = subtitle
+            .iter()
+            .map(|text| json!({ "text": text }))
+            .collect();
+        let items: Vec<Value> = icons
+            .iter()
+            .map(|icon| json!({ "menuNavigationItemRenderer": { "icon": { "iconType": icon } } }))
+            .collect();
+        json!({
+            "musicTwoRowItemRenderer": {
+                "title": { "runs": [{ "text": "plis dije" }] },
+                "subtitle": { "runs": runs },
+                "navigationEndpoint": { "browseEndpoint": { "browseId": format!("VL{id}") } },
+                "menu": { "menuRenderer": { "items": items } },
+            }
+        })
+    }
+
+    fn read(tile: &Value) -> Playlist {
+        let source = parse::two_row_playlist(tile).expect("the tile is a playlist");
+        library_playlist(source, "Zefanya").expect("the playlist is listed")
+    }
+
+    #[test]
+    fn a_playlist_made_before_the_channel_is_the_listeners_own() {
+        let playlist = read(&tile("PLold", &["18 songs"], &["QUEUE_PLAY_NEXT"]));
+
+        assert!(playlist.owned);
+        assert_eq!(playlist.owner, "Zefanya");
+        assert_eq!(playlist.track_count, 18);
+    }
+
+    #[test]
+    fn a_playlist_with_a_delete_action_is_the_listeners_own() {
+        let playlist = read(&tile(
+            "PLnew",
+            &["Zefanya", " • ", "21 songs"],
+            &["EDIT", "DELETE"],
+        ));
+
+        assert!(playlist.owned);
+        assert_eq!(playlist.owner, "Zefanya");
+    }
+
+    #[test]
+    fn a_saved_playlist_stays_its_authors() {
+        let playlist = read(&tile(
+            "PLsaved",
+            &["Someone Else", " • ", "40 songs"],
+            &["QUEUE_PLAY_NEXT"],
+        ));
+
+        assert!(!playlist.owned);
+        assert_eq!(playlist.owner, "Someone Else");
+    }
+
+    #[test]
+    fn the_saved_episodes_list_is_left_out() {
+        let source = parse::two_row_playlist(&tile(EPISODES, &["Auto playlist"], &[]))
+            .expect("the tile is a playlist");
+
+        assert!(library_playlist(source, "Zefanya").is_none());
+    }
+
+    /// The page of a playlist as the provider reports it, with the author it names.
+    fn page(author: Option<&str>, owned: bool) -> Playlist {
+        wire::playlist(
+            ytmusic::Playlist {
+                id: "PLpage".into(),
+                title: "Page".into(),
+                author: author.map(str::to_string),
+                owned,
+                public: None,
+                track_count: Some(3),
+                thumbnails: Vec::new(),
+            },
+            owned,
+            false,
+        )
+    }
+
+    #[test]
+    fn an_owned_playlist_page_names_the_listener() {
+        let mut playlist = page(None, true);
+        name_owned_playlist(&mut playlist, "Zefanya");
+
+        assert_eq!(playlist.owner, "Zefanya");
+    }
+
+    #[test]
+    fn a_saved_playlist_page_keeps_its_author() {
+        let mut playlist = page(Some("Someone Else"), false);
+        name_owned_playlist(&mut playlist, "Zefanya");
+
+        assert!(!playlist.owned);
+        assert_eq!(playlist.owner, "Someone Else");
+    }
+
+    #[test]
+    fn a_playlist_page_without_a_creator_names_nobody() {
+        let mut playlist = page(None, false);
+        name_owned_playlist(&mut playlist, "Zefanya");
+
+        assert!(playlist.owner.is_empty());
+    }
 }

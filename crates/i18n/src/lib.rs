@@ -1,8 +1,9 @@
 mod language;
 
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::{FluentResource, FluentValue};
@@ -16,6 +17,9 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 /// ever parses the active language and the English fallback.
 static BUNDLES: [OnceLock<FluentBundle<FluentResource>>; Language::ALL.len()] =
     [const { OnceLock::new() }; Language::ALL.len()];
+/// Keys already reported missing, per locale, so a key that renders every frame warns once.
+static MISSING: [Mutex<BTreeSet<Box<str>>>; Language::ALL.len()] =
+    [const { Mutex::new(BTreeSet::new()) }; Language::ALL.len()];
 
 pub trait Value<'a> {
     fn value(self) -> FluentValue<'a>;
@@ -83,7 +87,7 @@ pub fn lookup(key: &str, args: Option<&FluentArgs>) -> SharedString {
         return text;
     }
 
-    log::warn!("i18n: {key} is missing from {}", active.id());
+    warn_missing(active, key);
     if active != Language::English
         && let Some(text) = format(Language::English, key, args)
     {
@@ -103,6 +107,18 @@ pub fn translate(key: &str) -> SharedString {
         return text;
     }
     SharedString::from(key.to_owned())
+}
+
+/// Logs that `key` is missing from `language` the first time it happens and stays quiet after.
+fn warn_missing(language: Language, key: &str) {
+    let Ok(mut missing) = MISSING[language as usize].lock() else {
+        return;
+    };
+    if missing.contains(key) {
+        return;
+    }
+    missing.insert(key.into());
+    log::warn!("i18n: {key} is missing from {}", language.id());
 }
 
 fn format(language: Language, key: &str, args: Option<&FluentArgs>) -> Option<SharedString> {
@@ -127,19 +143,21 @@ fn bundle(language: Language) -> FluentBundle<FluentResource> {
     let mut bundle = FluentBundle::new_concurrent(vec![language.tag()]);
     bundle.set_use_isolating(false);
 
-    match FluentResource::try_new(language.source().to_owned()) {
-        Ok(resource) => {
-            if let Err(errors) = bundle.add_resource(resource) {
-                for error in errors {
-                    log::error!("i18n: cannot load {}: {error}", language.id());
+    for (name, source) in language.sources() {
+        match FluentResource::try_new((*source).to_owned()) {
+            Ok(resource) => {
+                if let Err(errors) = bundle.add_resource(resource) {
+                    for error in errors {
+                        log::error!("i18n: cannot load {}/{name}.ftl: {error}", language.id());
+                    }
                 }
             }
-        }
-        Err((resource, errors)) => {
-            for error in errors {
-                log::error!("i18n: cannot parse {}: {error}", language.id());
+            Err((resource, errors)) => {
+                for error in errors {
+                    log::error!("i18n: cannot parse {}/{name}.ftl: {error}", language.id());
+                }
+                bundle.add_resource_overriding(resource);
             }
-            bundle.add_resource_overriding(resource);
         }
     }
     bundle
@@ -148,8 +166,9 @@ fn bundle(language: Language) -> FluentBundle<FluentResource> {
 #[cfg(test)]
 fn keys(language: Language) -> Vec<&'static str> {
     let mut keys: Vec<&str> = language
-        .source()
-        .lines()
+        .sources()
+        .iter()
+        .flat_map(|(_, source)| source.lines())
         .filter(|line| !line.starts_with([' ', '#', '.', '*', '[']))
         .filter_map(|line| line.split_once(" =").map(|(key, _)| key))
         .filter(|key| !key.is_empty() && !key.starts_with('-'))

@@ -4,9 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-bundled-sqlite = ["rusqlite/bundled", "music/bundled-sqlite", "storage/bundled-sqlite"]
-
 [dependencies]
 anyhow.workspace = true
 cli.workspace = true
@@ -21,6 +18,7 @@ i18n.workspace = true
 icons.workspace = true
 image.workspace = true
 log.workspace = true
+logic.workspace = true
 moka.workspace = true
 music.workspace = true
 notify.workspace = true
@@ -55,3 +53,6 @@ objc2-io-kit.workspace = true
 
 [build-dependencies]
 embed.workspace = true
+
+[lints]
+workspace = true

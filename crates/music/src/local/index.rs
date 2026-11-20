@@ -91,6 +91,15 @@ impl Index {
         }
     }
 
+    /// Records one file the user opened straight from disk, so it survives a restart without
+    /// waiting for the next scan. A row for the same time and size is written again, which is
+    /// harmless: the scan takes it on trust either way.
+    pub fn remember(&self, path: &Path, known: Known) {
+        let mut changes = Changes::default();
+        changes.files.push((path.to_path_buf(), known));
+        self.save(&changes);
+    }
+
     /// Forgets every folder, so the next scan lists them all again and stats every file. This is
     /// what the Rescan button means: do not trust what you remember.
     pub fn distrust(&self) {
@@ -370,20 +379,20 @@ fn parse(rows: Vec<(String, String, i64, i64, String)>) -> Vec<Parsed> {
     let chunk = rows.len().div_ceil(threads).max(1);
 
     std::thread::scope(|scope| {
-        let workers: Vec<_> = rows
-            .chunks(chunk)
-            .map(|chunk| {
-                scope.spawn(|| {
-                    chunk
-                        .iter()
-                        .map(|(path, parent, mtime, size, track)| {
-                            let tagged = serde_json::from_str::<Tagged>(track).ok();
-                            (path.clone(), parent.clone(), *mtime, *size, tagged)
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
+        let mut workers = Vec::new();
+        for chunk in rows.chunks(chunk) {
+            workers.push(scope.spawn(|| {
+                chunk
+                    .iter()
+                    .map(|(path, parent, mtime, size, track)| {
+                        let tagged = serde_json::from_str::<Tagged>(track)
+                            .ok()
+                            .map(Tagged::restored);
+                        (path.clone(), parent.clone(), *mtime, *size, tagged)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
 
         workers
             .into_iter()

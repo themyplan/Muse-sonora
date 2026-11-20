@@ -703,8 +703,8 @@ fn design_sketch(design: Design, style: GlassStyle, cx: &App) -> Div {
 
 /// A thumbnail of a glass surface: a colourful field with a glass pill floating on it. The
 /// field's two accent bands give the pill something to blur, so the Frosted pill softens the
-/// edge between them and the Clear pill keeps it sharper. The pill is drawn from the same fill
-/// and blur the app draws its liquid popovers from, so the preview shows the real treatment.
+/// edge between them and the Clear pill keeps it sharper. The pill is drawn from the same fill,
+/// blur and sheen the app draws its liquid popovers from, so the preview shows the real treatment.
 fn glass_preview(style: GlassStyle, cx: &App) -> Div {
     let theme = cx.theme();
     let (fill, blur) = match style {
@@ -735,7 +735,7 @@ fn glass_preview(style: GlassStyle, cx: &App) -> Div {
                 .w(GLASS_PILL_W)
                 .h(GLASS_PILL_H)
                 .rounded_full()
-                .bg(theme.popover.opacity(fill))
+                .bg(ui::liquid_sheen(cx, fill))
                 .backdrop_blur(blur)
                 .border_1()
                 .border_color(ui::rim_color(cx)),

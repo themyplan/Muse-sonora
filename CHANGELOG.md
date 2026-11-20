@@ -14,6 +14,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Songs you open straight from disk now join your library, so they stay there after a restart without another scan.
 - Lyrics translations are now kept for songs whose lyrics come from the file itself, so they show again after a restart without another request.
 
+### Changed
+
+- Liquid Glass is stronger: brighter rims, harder blur, thinner fills and a top-lit sheen on glass pills.
+
+### Fixed
+
+- Songs opened straight from disk no longer leave the library when Sonora restarts, even when they live outside the scanned folders.
+
 ## [0.50.3] - 2026-11-20
 
 ### Changed

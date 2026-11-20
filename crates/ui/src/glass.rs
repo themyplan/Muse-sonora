@@ -1,5 +1,5 @@
 use gpui::prelude::*;
-use gpui::{App, Hsla, Pixels, px};
+use gpui::{App, Background, Hsla, Pixels, linear_color_stop, linear_gradient, px};
 
 use crate::theme::{ActiveTheme as _, Design, GlassStyle};
 
@@ -20,26 +20,26 @@ const CLEAR_BAR_FILL: f32 = 0.3;
 
 /// A liquid glass bar keeps less of its fill than a plain bar, and blurs harder, so the page
 /// shows through it. Frosted keeps more fill than Clear, which lets the rim do the work.
-const LIQUID_BAR_FILL: f32 = 0.55;
-const LIQUID_BAR_BLUR: Pixels = px(24.);
-const LIQUID_BAR_FILL_CLEAR: f32 = 0.3;
-const LIQUID_BAR_BLUR_CLEAR: Pixels = px(12.);
-const LIQUID_CLEAR_BAR_FILL: f32 = 0.18;
+const LIQUID_BAR_FILL: f32 = 0.45;
+const LIQUID_BAR_BLUR: Pixels = px(32.);
+const LIQUID_BAR_FILL_CLEAR: f32 = 0.22;
+const LIQUID_BAR_BLUR_CLEAR: Pixels = px(20.);
+const LIQUID_CLEAR_BAR_FILL: f32 = 0.12;
 /// A liquid glass control keeps less fill and blurs harder than a plain one.
-const LIQUID_FILL: f32 = 0.12;
-const LIQUID_BLUR: Pixels = px(12.);
-const LIQUID_FILL_CLEAR: f32 = 0.06;
-const LIQUID_BLUR_CLEAR: Pixels = px(6.);
+const LIQUID_FILL: f32 = 0.08;
+const LIQUID_BLUR: Pixels = px(20.);
+const LIQUID_FILL_CLEAR: f32 = 0.04;
+const LIQUID_BLUR_CLEAR: Pixels = px(10.);
 /// A liquid popover keeps less fill than a plain one, and blurs harder when frosted. The
 /// settings preview cards draw their glass pill from these same values, so the preview shows
 /// the real treatment.
-pub const LIQUID_POPOVER_FILL: f32 = 0.55;
-pub const LIQUID_POPOVER_BLUR: Pixels = px(16.);
-pub const LIQUID_POPOVER_FILL_CLEAR: f32 = 0.25;
-pub const LIQUID_POPOVER_BLUR_CLEAR: Pixels = px(6.);
+pub const LIQUID_POPOVER_FILL: f32 = 0.45;
+pub const LIQUID_POPOVER_BLUR: Pixels = px(24.);
+pub const LIQUID_POPOVER_FILL_CLEAR: f32 = 0.18;
+pub const LIQUID_POPOVER_BLUR_CLEAR: Pixels = px(12.);
 /// The corner radius of a liquid surface. Larger than the theme radius, so a liquid menu or
 /// card reads as a pill rather than a plain panel.
-const LIQUID_RADIUS: Pixels = px(18.);
+const LIQUID_RADIUS: Pixels = px(24.);
 /// The padding inside a bento box, and the radius of its corners.
 pub const BENTO_PAD: Pixels = px(12.);
 pub const BENTO_RADIUS: Pixels = px(20.);
@@ -65,15 +65,28 @@ pub fn liquid_clear(cx: &App) -> bool {
     matches!(cx.theme().glass_style, GlassStyle::Clear)
 }
 
-/// The colour of a liquid surface's rim: the popover foreground thinned, so the edge reads
-/// bright on a dark theme and dark on a light one, on either side of the glass.
+/// The colour of a liquid surface's rim: the popover foreground at half strength, so the edge
+/// reads clearly on a dark theme and dark on a light one, on either side of the glass.
 pub fn rim_color(cx: &App) -> Hsla {
-    cx.theme().popover_foreground.opacity(0.22)
+    cx.theme().popover_foreground.opacity(0.5)
 }
 
 /// The colour of a liquid surface's bright top edge, stronger than the rim around it.
 pub fn top_highlight_color(cx: &App) -> Hsla {
-    cx.theme().popover_foreground.opacity(0.45)
+    cx.theme().popover_foreground.opacity(0.8)
+}
+
+/// The sheen on a liquid pill: a top-lit gradient over the same fill, bright at the top
+/// fading to the fill, so the surface reads as light catching glass rather than a flat
+/// tint. Both stops come from the popover colour, so the sheen follows the theme. The
+/// settings preview draws its pill from this too, so the preview shows the real treatment.
+pub fn liquid_sheen(cx: &App, fill: f32) -> Background {
+    let popover = cx.theme().popover;
+    linear_gradient(
+        180.,
+        linear_color_stop(popover.opacity((fill + 0.3).min(1.)), 0.),
+        linear_color_stop(popover.opacity(fill), 1.),
+    )
 }
 
 /// Styles an element as frosted glass: a faint popover fill over a hard blur of
@@ -92,6 +105,8 @@ pub fn glass<E: Styled>(element: E, cx: &App) -> E {
             element
                 .bg(theme.popover.opacity(fill))
                 .backdrop_blur(blur)
+                .border_1()
+                .border_color(rim_color(cx))
         }
         false => element
             .bg(theme.popover.opacity(GLASS_FILL))
@@ -116,8 +131,8 @@ pub fn popover_fill(cx: &App) -> Hsla {
 }
 
 /// Gives a raised panel the same fill, foreground and backdrop blur as a context menu.
-/// With liquid glass it thins the fill, blurs harder, and gains a bright rim and a pill
-/// radius, so a menu reads as a glass pill over the page.
+/// With liquid glass it thins the fill, blurs harder, and gains a bright rim, a top-lit
+/// sheen and a pill radius, so a menu reads as a glass pill over the page.
 pub fn popover_surface<E: Styled>(element: E, cx: &App) -> E {
     let element = element
         .bg(popover_fill(cx))
@@ -125,11 +140,12 @@ pub fn popover_surface<E: Styled>(element: E, cx: &App) -> E {
     match blurring(cx) {
         true => match liquid_glass(cx) {
             true => {
-                let blur = match liquid_clear(cx) {
-                    true => LIQUID_POPOVER_BLUR_CLEAR,
-                    false => LIQUID_POPOVER_BLUR,
+                let (fill, blur) = match liquid_clear(cx) {
+                    true => (LIQUID_POPOVER_FILL_CLEAR, LIQUID_POPOVER_BLUR_CLEAR),
+                    false => (LIQUID_POPOVER_FILL, LIQUID_POPOVER_BLUR),
                 };
                 element
+                    .bg(liquid_sheen(cx, fill))
                     .backdrop_blur(blur)
                     .border_1()
                     .border_color(rim_color(cx))
@@ -195,7 +211,7 @@ pub fn bento<E: Styled>(element: E, cx: &App) -> E {
                 false => (LIQUID_POPOVER_FILL, LIQUID_POPOVER_BLUR),
             };
             element
-                .bg(theme.popover.opacity(fill))
+                .bg(liquid_sheen(cx, fill))
                 .backdrop_blur(blur)
                 .border_color(rim_color(cx))
         }

@@ -90,6 +90,34 @@ pub fn scan(roots: &[PathBuf], cache_dir: &Path, index: &Index) -> Scanned {
             walk(root, &remembered, &mut files, &mut folders, &progress);
         }
     }
+    // Files the user opened straight from disk that live outside every scanned
+    // folder: the index remembers them, but the walk above never reaches them,
+    // so without this they would never join the library again after a restart.
+    // Their rows stay in the index either way — only a file under a reached
+    // root is pruned when it leaves — so a remembered file is re-admitted from
+    // its stored tags when it is unchanged, or read again when it moved. A file
+    // that is gone is left alone: its row stays for when it comes back, the
+    // way an offline folder keeps its rows.
+    let mut outside = Vec::new();
+    for (path, known) in &remembered.files {
+        if reached.iter().any(|root| path.starts_with(root)) {
+            continue;
+        }
+        if !is_audio_file(path) {
+            continue;
+        }
+        let Some((mtime, size)) = stat(path) else {
+            continue;
+        };
+        outside.push(Found {
+            path: path.clone(),
+            mtime,
+            size,
+            known: known.mtime == mtime && known.size == size,
+        });
+    }
+    outside.sort_by(|a, b| a.path.cmp(&b.path));
+    files.extend(outside);
     let found = files.len();
     // Every folder is looked at again for an artist portrait, so the count covers both passes
     // and the percentage does not sit at full while the second one runs.

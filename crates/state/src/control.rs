@@ -945,7 +945,9 @@ fn lyrics_snapshot(
         ..snapshot
     };
     match &hit.lyrics {
-        Sheet::Plain { text, romanized } => {
+        // `sonora lyrics` prints text and romanization only: the wire line has no
+        // translation, which the app's lyrics view shows instead.
+        Sheet::Plain { text, romanized, translated: _ } => {
             let romanized: Vec<&str> = romanized
                 .iter()
                 .flat_map(|romanized| romanized.text.lines())
@@ -1249,6 +1251,7 @@ mod tests {
                 text: "sayonara\n\n".to_owned(),
                 ..Default::default()
             }),
+            translated: None,
         });
         let snapshot = at(&held, 3);
         assert!(!snapshot.synced);

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Context, Entity, Task};
+use logic::lyrics::{awaits_better, gather, ordered};
 use music::lyrics::LOCAL;
 use music::{LyricsHit, LyricsProvider, LyricsQuery, Track, TrackKey};
-use tokio::task::JoinSet;
 
 use crate::sheets::{Sheets, Unsaved};
 use crate::{AppSettings, Io, Outcome, Playback, Queue, QueuePosition, Session, Toasts, join};
@@ -54,6 +54,8 @@ pub struct Lyrics {
     /// The order of the sources the answer on show was ranked by. A new order looks the track
     /// up again, from what is held, so the source now ranked first is the one shown.
     priority: Vec<String>,
+    /// Whether the answer on show was ranked with word-by-word lyrics ahead of the source order.
+    worded_first: bool,
     playback: Entity<Playback>,
     session: Entity<Session>,
     settings: Entity<AppSettings>,
@@ -101,12 +103,20 @@ impl Lyrics {
             this.prefetch(cx);
         })
         .detach();
+        // a lookup ahead that waited on the current track's is started on a later tick
+        let ticks = playback.read(cx).ticks().clone();
+        cx.observe(&ticks, |this, _, cx| {
+            this.follow(cx);
+            this.prefetch(cx);
+        })
+        .detach();
         cx.observe(&queue, |this, _, cx| this.prefetch(cx)).detach();
         cx.observe(&settings, |this, settings, cx| {
             let settings = settings.read(cx);
             let on = settings.lyrics_enabled();
             let enabled = settings.lyrics_providers();
             let priority = settings.lyrics_provider_priority();
+            let worded_first = settings.lyrics_word_synced_first();
             let translation_on = settings.lyrics_translation_enabled();
             let translation_provider = settings.translation_provider();
             let translation_provider_name = translation_provider.name().to_owned();
@@ -114,8 +124,10 @@ impl Lyrics {
                 music::lyrics::translate::has_translation_key(translation_provider);
             let translation_base_url = settings.translation_base_url().to_owned();
             let translation_model = settings.translation_model().to_owned();
-            let lyrics_changed =
-                on != this.enabled || enabled != this.enabled_providers || priority != this.priority;
+            let lyrics_changed = on != this.enabled
+                || enabled != this.enabled_providers
+                || priority != this.priority
+                || worded_first != this.worded_first;
             let provider_changed = translation_provider_name != this.translation_provider_name;
             let key_flipped = !this.translation_has_key && translation_has_key;
             let base_or_model_changed = translation_base_url != this.translation_base_url
@@ -136,6 +148,7 @@ impl Lyrics {
                 this.enabled = on;
                 this.enabled_providers = enabled.to_vec();
                 this.priority = priority;
+                this.worded_first = worded_first;
                 this.task = None;
                 this.ahead = None;
                 this.ahead_of = None;
@@ -189,6 +202,7 @@ impl Lyrics {
         let enabled = settings.read(cx).lyrics_enabled();
         let enabled_providers = settings.read(cx).lyrics_providers().to_vec();
         let priority = settings.read(cx).lyrics_provider_priority();
+        let worded_first = settings.read(cx).lyrics_word_synced_first();
         let translation_enabled = settings.read(cx).lyrics_translation_enabled();
         let translation_provider = settings.read(cx).translation_provider();
         let translation_provider_name = translation_provider.name().to_owned();
@@ -216,6 +230,7 @@ impl Lyrics {
             enabled,
             enabled_providers,
             priority,
+            worded_first,
             playback,
             session,
             settings,
@@ -331,10 +346,11 @@ impl Lyrics {
             .cloned()
             .collect();
         let priority = settings.lyrics_provider_priority();
+        let worded_first = settings.lyrics_word_synced_first();
         let instrumental = music::lyrics::instrumental(query, &hits);
         self.task = None;
         self.settled = true;
-        self.hits = ordered(query, hits, &priority);
+        self.hits = ordered(query, hits, &priority, worded_first);
         self.state = state_for(&self.hits, instrumental);
         cx.notify();
         self.maybe_translate(cx);
@@ -491,6 +507,7 @@ impl Lyrics {
     fn fetch(&mut self, id: String, track: Track, cx: &mut Context<Self>) -> Task<()> {
         let settings = self.settings.read(cx);
         let priority = settings.lyrics_provider_priority();
+        let worded_first = settings.lyrics_word_synced_first();
         let enabled: Vec<&'static str> = self
             .providers
             .iter()
@@ -563,7 +580,7 @@ impl Lyrics {
             while let Some((from, mut found)) = incoming.recv().await {
                 pending.retain(|name| Some(*name) != from);
                 hits.append(&mut found);
-                let ranked = ordered(&ranking, hits.clone(), &priority);
+                let ranked = ordered(&ranking, hits.clone(), &priority, worded_first);
                 let Some(best) = ranked.first().cloned() else {
                     continue;
                 };
@@ -571,14 +588,8 @@ impl Lyrics {
                     synced = best.lyrics.synced();
                     displayed = Some(best);
                 }
-                // Full synced lyrics can only lose to a source ranked higher, anything else to
-                // whichever source answers next.
                 let waiting = displayed.as_ref().is_some_and(|displayed| {
-                    let place = match music::lyrics::fully_synced(&ranking, &displayed.lyrics) {
-                        true => rank_in(&priority, displayed.source),
-                        false => usize::MAX,
-                    };
-                    pending.iter().any(|name| rank_in(&priority, name) < place)
+                    awaits_better(&ranking, displayed, &pending, &priority, worded_first)
                 });
                 let anchor = displayed.clone();
                 this.update(cx, |this, cx| {
@@ -600,7 +611,7 @@ impl Lyrics {
                         this.keep(id, cached, &hits, answered, cx);
                         if current {
                             let instrumental = music::lyrics::instrumental(&ranking, &hits);
-                            let ranked = ordered(&ranking, hits, &priority);
+                            let ranked = ordered(&ranking, hits, &priority, worded_first);
                             this.settle(ranked, displayed.as_ref(), instrumental, cx);
                         }
                     }
@@ -1217,24 +1228,6 @@ fn drop_translations(lyrics: &mut music::Lyrics) {
     }
 }
 
-fn ordered(query: &LyricsQuery, hits: Vec<LyricsHit>, priority: &[String]) -> Vec<LyricsHit> {
-    let mut ranked = music::lyrics::rank_with_priority(query, hits, priority);
-    music::lyrics::reshape(&mut ranked);
-    ranked
-}
-
-/// Hits sent to a lookup, with the provider that has now answered. Hits held from an earlier
-/// lookup come with no provider.
-type Reply = (Option<&'static str>, Vec<LyricsHit>);
-
-/// Where `source` stands in the user's priority. Sources missing from it come last.
-fn rank_in(priority: &[String], source: &str) -> usize {
-    priority
-        .iter()
-        .position(|name| name == source)
-        .unwrap_or(priority.len())
-}
-
 /// What the services have said about one track: every hit matched to it, unranked and from every
 /// source, and the services that replied. The selection is applied when it is shown.
 #[derive(Clone, Default)]
@@ -1277,57 +1270,6 @@ fn query_for(track: &Track, key: Option<TrackKey>) -> LyricsQuery {
         duration: track.duration,
         track: key,
     }
-}
-
-/// Asks every provider at once and sends each one's name and hits for the queried track as
-/// they arrive. A provider that fails sends its name with no hits, so the receiver knows it is
-/// done. Returns the providers that replied, leaving out any that failed.
-async fn gather(
-    providers: Vec<Arc<dyn LyricsProvider>>,
-    query: LyricsQuery,
-    sender: tokio::sync::mpsc::UnboundedSender<Reply>,
-) -> anyhow::Result<Vec<&'static str>> {
-    let mut tasks = JoinSet::new();
-    for provider in providers {
-        let query = query.clone();
-        tasks.spawn(async move {
-            let name = provider.name();
-            let found = provider
-                .search(&query)
-                .await
-                .inspect_err(|error| log::warn!("lyrics: {name} did not answer: {error:#}"))
-                .ok()
-                .map(|mut found| {
-                    // Hits for another track are dropped here, before the lookup holds and
-                    // copies them.
-                    found.retain(|hit| music::lyrics::matched(&query, hit));
-                    log::debug!(
-                        "lyrics: {name} returned {} matching answer(s) for {}",
-                        found.len(),
-                        query.title
-                    );
-                    found
-                });
-            (name, found)
-        });
-    }
-    let mut answered = Vec::new();
-    while !tasks.is_empty() {
-        tokio::select! {
-            // Dropping the foreground lookup (including on a provider change) must also
-            // stop its network requests. Dropping this JoinSet aborts the remaining tasks.
-            _ = sender.closed() => break,
-            found = tasks.join_next() => {
-                if let Some(Ok((name, found))) = found {
-                    if found.is_some() {
-                        answered.push(name);
-                    }
-                    sender.send((Some(name), found.unwrap_or_default())).ok();
-                }
-            }
-        }
-    }
-    Ok(answered)
 }
 
 #[cfg(test)]

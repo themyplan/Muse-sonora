@@ -87,9 +87,26 @@ impl SettingsView {
 
     pub(super) fn lyrics_sources_groups(&self) -> Vec<Group> {
         vec![
+            Group::untitled().rows([Slot::WordSyncedFirst]),
             Group::new("settings-group-lyrics-order", "icons/arrow-up-down.svg")
                 .rows([Slot::LyricsPriority]),
         ]
+    }
+
+    pub(super) fn word_synced_first_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.settings.read(cx).lyrics_word_synced_first();
+
+        self.row(
+            t!("settings-lyrics-word-synced-first"),
+            Switch::new("lyrics-word-synced-first", on)
+                .name(t!("settings-lyrics-word-synced-first"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings.update(cx, |settings, cx| {
+                        settings.set_lyrics_word_synced_first(!on, cx)
+                    });
+                }))
+                .into_any_element(),
+        )
     }
 
     pub(super) fn panel_lyrics_size_row(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -149,10 +166,7 @@ impl SettingsView {
             .child(step("smaller", "\u{2212}", "settings-font-smaller", -0.1))
             .child(ui::spoken(
                 SharedString::from(format!("{id}-value")),
-                t!(
-                    "settings-lyrics-size-value",
-                    size = (scale * 100.).round() as i64
-                ),
+                t!("unit-percent", value = (scale * 100.).round() as i64),
             ))
             .child(step("larger", "+", "settings-font-larger", 0.1));
 
@@ -636,12 +650,12 @@ pub(super) fn romanization_script_copy(
     writing_system: WritingSystem,
 ) -> (&'static str, &'static str) {
     match writing_system {
-        WritingSystem::Japanese => ("romanization-japanese", "settings-romanization-japanese"),
-        WritingSystem::Chinese => ("romanization-chinese", "settings-romanization-chinese"),
-        WritingSystem::Korean => ("romanization-korean", "settings-romanization-korean"),
+        WritingSystem::Japanese => ("romanization-japanese", "language-ja"),
+        WritingSystem::Chinese => ("romanization-chinese", "language-zh"),
+        WritingSystem::Korean => ("romanization-korean", "language-ko"),
         WritingSystem::Cyrillic => ("romanization-cyrillic", "settings-romanization-cyrillic"),
         WritingSystem::Greek => ("romanization-greek", "settings-romanization-greek"),
-        WritingSystem::Arabic => ("romanization-arabic", "settings-romanization-arabic"),
+        WritingSystem::Arabic => ("romanization-arabic", "language-ar"),
         WritingSystem::Other => ("romanization-other", "settings-romanization-other"),
     }
 }
@@ -655,8 +669,9 @@ impl Render for DraggedSource {
 /// The name a lyrics source goes by in the settings, falling back to the provider's own name.
 pub(super) fn source_name(provider: &str) -> SharedString {
     let key = match provider {
-        music::lyrics::LOCAL => "settings-lyrics-provider-local",
+        music::lyrics::LOCAL => "common-local-files",
         "Subsonic" => "settings-lyrics-provider-subsonic",
+        "Jellyfin" => "settings-lyrics-provider-jellyfin",
         "Spotify" => "settings-lyrics-provider-spotify",
         "YouTube Music" => "settings-lyrics-provider-youtube",
         "Apple Music" => "settings-lyrics-provider-apple-music",

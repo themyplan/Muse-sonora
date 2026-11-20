@@ -1,5 +1,9 @@
 use unic_langid::{LanguageIdentifier, langid};
 
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/locales.rs"));
+}
+
 pub const AUTO: &str = "auto";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,19 +16,22 @@ pub enum Language {
     Italian,
     Indonesian,
     Japanese,
+    Korean,
     Russian,
     Ukrainian,
     Polish,
     Czech,
     PortugueseBrazilian,
+    PortugueseEuropean,
     ChineseSimplified,
     Turkish,
     Albanian,
+    Vietnamese,
     Persian,
 }
 
 impl Language {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::English,
         Self::German,
         Self::Spanish,
@@ -32,14 +39,17 @@ impl Language {
         Self::Italian,
         Self::Indonesian,
         Self::Japanese,
+        Self::Korean,
         Self::Russian,
         Self::Ukrainian,
         Self::Polish,
         Self::Czech,
         Self::PortugueseBrazilian,
+        Self::PortugueseEuropean,
         Self::ChineseSimplified,
         Self::Turkish,
         Self::Albanian,
+        Self::Vietnamese,
         Self::Persian,
     ];
 
@@ -52,14 +62,17 @@ impl Language {
             Self::Italian => "it",
             Self::Indonesian => "id",
             Self::Japanese => "ja",
+            Self::Korean => "ko",
             Self::Russian => "ru",
             Self::Ukrainian => "uk",
             Self::Polish => "pl",
             Self::Czech => "cs",
             Self::PortugueseBrazilian => "pt-BR",
+            Self::PortugueseEuropean => "pt-PT",
             Self::ChineseSimplified => "zh-CN",
             Self::Turkish => "tr",
             Self::Albanian => "sq",
+            Self::Vietnamese => "vi",
             Self::Persian => "fa",
         }
     }
@@ -73,14 +86,17 @@ impl Language {
             Self::Italian => "Italiano",
             Self::Indonesian => "Bahasa Indonesia",
             Self::Japanese => "日本語",
+            Self::Korean => "한국어",
             Self::Russian => "Русский",
             Self::Ukrainian => "Українська",
             Self::Polish => "Polski",
             Self::Czech => "Čeština",
             Self::PortugueseBrazilian => "Português (Brasil)",
+            Self::PortugueseEuropean => "Português (Portugal)",
             Self::ChineseSimplified => "简体中文",
             Self::Turkish => "Türkçe",
             Self::Albanian => "Shqip",
+            Self::Vietnamese => "Tiếng Việt",
             Self::Persian => "فارسی",
         }
     }
@@ -90,14 +106,23 @@ impl Language {
     }
 
     pub fn detect() -> Self {
-        let Some(locale) = sys_locale::get_locale() else {
-            return Self::English;
-        };
-        let primary = base(&locale);
+        sys_locale::get_locale().map_or(Self::English, |locale| Self::closest(&locale))
+    }
+
+    /// The shipped language nearest to a system locale such as `pt-PT` or `pt_PT.UTF-8`. A
+    /// language shipped for more than one region is matched on the region first. A region
+    /// nothing ships for falls back to the first variant of that language in `ALL`.
+    fn closest(locale: &str) -> Self {
+        let wanted = parts(locale);
 
         Self::ALL
             .into_iter()
-            .find(|language| base(language.id()) == primary)
+            .find(|language| parts(language.id()) == wanted)
+            .or_else(|| {
+                Self::ALL
+                    .into_iter()
+                    .find(|language| parts(language.id()).0 == wanted.0)
+            })
             .unwrap_or(Self::English)
     }
 
@@ -110,37 +135,23 @@ impl Language {
             Self::Italian => langid!("it"),
             Self::Indonesian => langid!("id"),
             Self::Japanese => langid!("ja"),
+            Self::Korean => langid!("ko"),
             Self::Russian => langid!("ru"),
             Self::Ukrainian => langid!("uk"),
             Self::Polish => langid!("pl"),
             Self::Czech => langid!("cs"),
             Self::PortugueseBrazilian => langid!("pt-BR"),
+            Self::PortugueseEuropean => langid!("pt-PT"),
             Self::ChineseSimplified => langid!("zh-CN"),
             Self::Turkish => langid!("tr"),
             Self::Albanian => langid!("sq"),
+            Self::Vietnamese => langid!("vi"),
             Self::Persian => langid!("fa"),
         }
     }
 
-    pub(crate) fn source(self) -> &'static str {
-        match self {
-            Self::English => include_str!("../../../assets/i18n/en-US/main.ftl"),
-            Self::German => include_str!("../../../assets/i18n/de/main.ftl"),
-            Self::Spanish => include_str!("../../../assets/i18n/es/main.ftl"),
-            Self::French => include_str!("../../../assets/i18n/fr/main.ftl"),
-            Self::Italian => include_str!("../../../assets/i18n/it/main.ftl"),
-            Self::Indonesian => include_str!("../../../assets/i18n/id/main.ftl"),
-            Self::Japanese => include_str!("../../../assets/i18n/ja/main.ftl"),
-            Self::Russian => include_str!("../../../assets/i18n/ru/main.ftl"),
-            Self::Ukrainian => include_str!("../../../assets/i18n/uk/main.ftl"),
-            Self::Polish => include_str!("../../../assets/i18n/pl/main.ftl"),
-            Self::Czech => include_str!("../../../assets/i18n/cs/main.ftl"),
-            Self::PortugueseBrazilian => include_str!("../../../assets/i18n/pt-BR/main.ftl"),
-            Self::ChineseSimplified => include_str!("../../../assets/i18n/zh-CN/main.ftl"),
-            Self::Turkish => include_str!("../../../assets/i18n/tr/main.ftl"),
-            Self::Albanian => include_str!("../../../assets/i18n/sq/main.ftl"),
-            Self::Persian => include_str!("../../../assets/i18n/fa/main.ftl"),
-        }
+    pub(crate) fn sources(self) -> &'static [(&'static str, &'static str)] {
+        generated::sources(self.id())
     }
 }
 
@@ -148,9 +159,46 @@ pub fn resolve(id: &str) -> Language {
     Language::from_id(id).unwrap_or_else(Language::detect)
 }
 
-fn base(tag: &str) -> String {
-    tag.split(['-', '_'])
-        .next()
-        .unwrap_or_default()
-        .to_lowercase()
+/// The language and the region of a locale tag, lowercased and uppercased. The encoding and
+/// modifier a POSIX locale carries are dropped, and so is a script such as `Hans`.
+fn parts(tag: &str) -> (String, Option<String>) {
+    let tag = tag.split(['.', '@']).next().unwrap_or_default();
+    let mut subtags = tag.split(['-', '_']);
+    let language = subtags.next().unwrap_or_default().to_lowercase();
+    let region = subtags
+        .find(|subtag| {
+            subtag.len() == 2 && subtag.chars().all(|letter| letter.is_ascii_alphabetic())
+        })
+        .map(str::to_uppercase);
+    (language, region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_region_picks_its_own_variant() {
+        assert_eq!(Language::closest("pt-PT"), Language::PortugueseEuropean);
+        assert_eq!(
+            Language::closest("pt_PT.UTF-8"),
+            Language::PortugueseEuropean
+        );
+        assert_eq!(Language::closest("pt-BR"), Language::PortugueseBrazilian);
+        assert_eq!(Language::closest("zh-Hans-CN"), Language::ChineseSimplified);
+    }
+
+    #[test]
+    fn an_unshipped_region_falls_back_to_the_language() {
+        assert_eq!(Language::closest("pt"), Language::PortugueseBrazilian);
+        assert_eq!(Language::closest("pt-AO"), Language::PortugueseBrazilian);
+        assert_eq!(Language::closest("de-AT"), Language::German);
+        assert_eq!(Language::closest("en-GB"), Language::English);
+    }
+
+    #[test]
+    fn an_unknown_language_falls_back_to_english() {
+        assert_eq!(Language::closest("nl-NL"), Language::English);
+        assert_eq!(Language::closest(""), Language::English);
+    }
 }

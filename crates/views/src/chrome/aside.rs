@@ -1,14 +1,14 @@
 use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::rc::Rc;
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, path::PathBuf};
 
 use gpui::prelude::*;
 
 use gpui::accesskit::{Role, Toggled};
 use gpui::{
-    Animation, AnimationExt as _, App, Bounds, Context, Div, DragMoveEvent, Entity, FontWeight,
-    MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, ScrollStrategy,
+    Animation, AnimationExt as _, App, Bounds, Context, Div, DragMoveEvent, Entity, ExternalPaths,
+    FontWeight, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, ScrollStrategy,
     SharedString, Size, SpringConfig, SpringState, Task, UniformListScrollHandle, Window, canvas,
     div, ease_in_out, px, relative, size, svg, uniform_list,
 };
@@ -21,10 +21,10 @@ use state::{
     Sonora, Whence,
 };
 use ui::{
-    ActiveTheme as _, Avatar, Button, Card, DraggedPin, Edge, Initials, Motion, Motioned as _,
-    PREFETCH_REACH, Pin, Pinnable as _, Popup, Scrollbar, Scroller, Spot, Springs, Tails as _,
-    Text, Vacancy, drop_gap, drop_marker, ease_out_cubic, ease_out_expo, eyebrow, faint, mix,
-    prefetch, snapped, vacant,
+    ActiveTheme as _, Avatar, Button, Card, DraggedPin, Edge, Glowing as _, Initials, Motion,
+    Motioned as _, PREFETCH_REACH, Pin, Pinnable as _, Popup, Scrollbar, Scroller, Spot, Springs,
+    Tails as _, Text, Vacancy, drop_gap, drop_marker, ease_out_cubic, ease_out_expo, eyebrow,
+    faint, mix, prefetch, snapped, vacant,
 };
 use unicode_bidi::{BidiClass, Direction};
 
@@ -79,8 +79,9 @@ const LAG_TRAIL: f32 = 0.9;
 const LAG_STAGGER: f32 = 0.35;
 const LAG_LEAST: Pixels = px(0.05);
 const LAG_STALL: f32 = 0.064;
-// Below this a blur is not worth a layer of its own.
-const HAZE_LEAST: Pixels = px(0.05);
+/// Below this a blur is not worth a layer of its own. The smallest `HAZE_STEP` falls under it,
+/// since a quarter of a pixel cannot be seen and every distinct blur costs a whole layer.
+const HAZE_LEAST: Pixels = px(0.3);
 /// The step a row's blur is rounded to. Neighbouring rows that land on the same step share one
 /// offscreen layer in the renderer, where each distinct blur costs a layer of its own.
 const HAZE_STEP: Pixels = px(0.25);
@@ -95,6 +96,12 @@ const PRESSED: f32 = 0.955;
 const RESOLVE_BLUR: f32 = 0.2;
 const RESOLVE_FADE: f32 = 0.5;
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long the sheet may go undrawn before the song counts as having moved on without it. A
+/// sheet that comes back later than this, to a verse more than one row from the one it left,
+/// is put there at once rather than scrolled across everything it missed.
+const AWAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// How far the place a put verse belongs may drift, in pixels, before the sheet is put again.
+const PUT_REST: f32 = 0.5;
 const INSTRUMENTAL_BREAK: std::time::Duration = std::time::Duration::from_secs(5);
 const SWEEP_LEAST: std::time::Duration = std::time::Duration::from_millis(180);
 // karaoke sweep ceiling
@@ -164,6 +171,12 @@ struct RowLook {
     remote: bool,
 }
 
+/// What a drop onto the queue carried: drag within the app, or files from another program.
+enum Dragged<'a> {
+    Pin(&'a DraggedPin),
+    Paths(&'a [PathBuf]),
+}
+
 /// The credit under a sheet, resolved once for the answer it names and the language it was read
 /// in, since the sheet redraws every frame while a song plays.
 struct Credit {
@@ -210,6 +223,13 @@ pub(crate) struct Aside {
     verse_of: Option<String>,
     verse_take: u64,
     placing: bool,
+    /// The verse the sheet was last put on without a glide, and the offset it was put at. While
+    /// that verse is still the one followed, the sheet is put again whenever layout moves the
+    /// place it belongs, since the rows only reach their final sizes a few frames after the
+    /// sheet first shows.
+    put: Option<(usize, Pixels)>,
+    /// When the verses were last followed, which tells a sheet that was off screen for a while.
+    drawn: std::time::Instant,
     context_menu: Option<ContextMenuState>,
     track_menu: ItemMenu,
     drop_gap: Option<usize>,
@@ -290,6 +310,9 @@ impl Aside {
         })
         .detach();
         cx.observe(&playback, |_, _, cx| cx.notify()).detach();
+        // the lyrics follow the position as it moves
+        let ticks = playback.read(cx).ticks().clone();
+        cx.observe(&ticks, |_, _, cx| cx.notify()).detach();
         let chrome = Chrome::entity(cx);
         cx.observe(&chrome, |_, _, cx| cx.notify()).detach();
 
@@ -322,6 +345,8 @@ impl Aside {
             verse_of: None,
             verse_take: 0,
             placing: false,
+            put: None,
+            drawn: std::time::Instant::now(),
             context_menu: None,
             track_menu: ItemMenu::new(playlist_scrollbar, cx),
             drop_gap: None,
@@ -419,7 +444,7 @@ impl Aside {
         let settling = self.fading == Some(spot);
         Touch {
             warmth: match (waking, settling) {
-                (true, _) => sharpen,
+                (true, _) => 1.,
                 (_, true) => 1. - sharpen,
                 _ => 0.,
             },
@@ -503,7 +528,7 @@ impl Aside {
     }
 
     fn sharpen_progress(&self, window: &mut Window) -> f32 {
-        let span = Motion::Quick.span().as_secs_f32().max(f32::EPSILON);
+        let span = ui::dim_span().as_secs_f32().max(f32::EPSILON);
         let progress = (self.since.elapsed().as_secs_f32() / span).clamp(0., 1.);
         if progress < 1. {
             window.request_animation_frame();
@@ -513,6 +538,7 @@ impl Aside {
 
     fn forget_verse(&mut self) {
         self.flying = false;
+        self.put = None;
         self.pinning = None;
         self.previous_active_line = None;
         self.departing_line = None;
@@ -590,6 +616,7 @@ impl Aside {
         Some(px(state.position))
     }
 
+    /// Lights the spot under the pointer at once, and lets the one the pointer left fade out.
     fn set_hovered(&mut self, spot: Warm, over: bool, cx: &mut Context<Self>) {
         if !over {
             if self.over == Some(spot) {
@@ -597,20 +624,7 @@ impl Aside {
             }
             if self.hovered == Some(spot) {
                 self.hovered = None;
-                self.fading = Some(spot);
-                self.since = std::time::Instant::now();
-                self.linger = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Motion::Quick.span()).await;
-                    this.update(cx, |this, cx| {
-                        if this.fading != Some(spot) {
-                            return;
-                        }
-                        this.fading = None;
-                        cx.notify();
-                    })
-                    .ok();
-                }));
-                cx.notify();
+                self.settle(spot, cx);
             }
             return;
         }
@@ -619,17 +633,54 @@ impl Aside {
         if self.hovered == Some(spot) {
             return;
         }
-        self.fading = None;
+        if self.fading == Some(spot) {
+            self.fading = None;
+        }
+        // The spot the pointer came from may hear it leave only after this one hears it
+        // arrive, so its fade starts here.
+        if let Some(left) = self.hovered.replace(spot) {
+            self.settle(left, cx);
+        }
+        cx.notify();
+    }
+
+    /// Starts the fade of a spot the pointer has left, and forgets the spot once it is over.
+    fn settle(&mut self, spot: Warm, cx: &mut Context<Self>) {
+        self.fading = Some(spot);
+        self.since = std::time::Instant::now();
         self.linger = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ui::dim_span()).await;
             this.update(cx, |this, cx| {
-                if this.over != Some(spot) {
+                if this.fading != Some(spot) {
                     return;
                 }
-                this.hovered = Some(spot);
+                this.fading = None;
                 cx.notify();
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    fn set_gap(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        position: Point<Pixels>,
+        row: usize,
+        from: Option<Spot>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(gap) = drop_gap(bounds, position, row) else {
+            return;
+        };
+        let gap = match from {
+            Some(held) => (gap != held.index && gap != held.index + 1).then_some(gap),
+            None => Some(gap),
+        };
+        if self.drop_gap != gap {
+            self.drop_gap = gap;
+            cx.notify();
+        }
     }
 
     fn enqueue(&mut self, pin: &Pin, gap: Option<usize>, cx: &mut Context<Self>) {
@@ -637,19 +688,29 @@ impl Aside {
             .update(cx, |playback, cx| playback.enqueue_pin(pin, gap, cx));
     }
 
+    fn enqueue_paths(&mut self, paths: &[PathBuf], gap: Option<usize>, cx: &mut Context<Self>) {
+        self.playback.update(cx, |playback, cx| {
+            playback.enqueue_paths(paths.to_vec(), gap, cx)
+        });
+    }
+
     /// Applies a drop anywhere on the queue at the gap the marker shows, since the marker reaches
     /// past a row into the header and spacing around it. A track moved within the queue stays put
-    /// when no gap is marked, and a track dragged in from elsewhere then goes to the end.
-    fn land(&mut self, dragged: &DraggedPin, cx: &mut Context<Self>) {
+    /// when no gap is marked, and a track dragged in from elsewhere then goes to the end. Files
+    /// from another program go in at the marked gap, or at the end when none is marked.
+    fn land(&mut self, dropped: Dragged<'_>, cx: &mut Context<Self>) {
         let gap = self.drop_gap.take();
-        match (dragged.spot(QUEUE), gap) {
-            (Some(held), Some(gap)) => self.queue.update(cx, |queue, cx| {
-                if queue.revision() == held.revision {
-                    queue.move_upcoming_to_gap(held.index, gap, cx);
-                }
-            }),
-            (Some(_), None) => {}
-            (None, gap) => self.enqueue(&dragged.pin, gap, cx),
+        match dropped {
+            Dragged::Pin(dragged) => match (dragged.spot(QUEUE), gap) {
+                (Some(held), Some(gap)) => self.queue.update(cx, |queue, cx| {
+                    if queue.revision() == held.revision {
+                        queue.move_upcoming_to_gap(held.index, gap, cx);
+                    }
+                }),
+                (Some(_), None) => {}
+                (None, gap) => self.enqueue(&dragged.pin, gap, cx),
+            },
+            Dragged::Paths(paths) => self.enqueue_paths(paths, gap, cx),
         }
         cx.notify();
     }
@@ -734,7 +795,7 @@ impl Aside {
                     .text_size(theme.text(Text::Small))
                     .truncate(),
                 )
-                .when_some(added, |this, added| this.child(adder(added, theme))),
+                .when_some(added, |this, added| this.child(adder(added, &theme))),
         )
         .tint(title)
         .when(track.explicit, Card::explicit)
@@ -792,20 +853,20 @@ impl Aside {
         .when_some(queue_index, |this, target| {
             this.on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedPin>, _, cx| {
-                    let Some(gap) = drop_gap(event.bounds, event.event.position, target) else {
-                        return;
-                    };
-                    let gap = match event.drag(cx).spot(QUEUE) {
-                        Some(held) => (gap != held.index && gap != held.index + 1).then_some(gap),
-                        None => Some(gap),
-                    };
-                    if this.drop_gap != gap {
-                        this.drop_gap = gap;
-                        cx.notify();
-                    }
+                    this.set_gap(
+                        event.bounds,
+                        event.event.position,
+                        target,
+                        event.drag(cx).spot(QUEUE),
+                        cx,
+                    );
                 }),
             )
-            .on_drop(cx.listener(|this, dragged: &DraggedPin, _, cx| this.land(dragged, cx)))
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    this.set_gap(event.bounds, event.event.position, target, None, cx);
+                },
+            ))
         })
         .when_some(pin, |this, pin| match queue_index {
             Some(index) => this.pin_from(pin, Spot::new(QUEUE, index).revision(queue_revision)),
@@ -958,6 +1019,17 @@ impl Aside {
         let perch = ui::return_to("queue-return-top", &self.scrollbar, goal, tooltip, cx)?;
 
         Some(self.raised(perch, cx))
+    }
+
+    /// The floating follow and return buttons of a fullscreen aside, which leaves them out of
+    /// its own render. The fullscreen player draws them over the panel itself, so they stay
+    /// above the visualizer it lays over the panel's text.
+    pub(crate) fn perches(&self, window: &Window, cx: &mut Context<Self>) -> Vec<Div> {
+        let sections = self.playback.read(cx).shown_queue(cx).sections;
+        self.follow(cx)
+            .into_iter()
+            .chain(self.recall(&sections, window, cx))
+            .collect()
     }
 
     /// Keeps floating controls above the workspace player bar and the strip over it, or above
@@ -1114,14 +1186,20 @@ impl Aside {
         // Both voices and wrapped phrases share the same inset from either panel edge.
         let wrap_width = (row_width - verse_pad * 2.).max(Pixels::ZERO);
         let wrap_font = font_key(self.settings.read(cx).font());
-        if self.lyrics_wrap_width != Some(wrap_width)
+        let rewrapped = self.lyrics_wrap_width != Some(wrap_width)
             || self.lyrics_wrap_size != Some(wrap_size)
-            || self.lyrics_wrap_font != Some(wrap_font)
-        {
+            || self.lyrics_wrap_font != Some(wrap_font);
+        if rewrapped {
             self.lyrics_wrap_width = Some(wrap_width);
             self.lyrics_wrap_size = Some(wrap_size);
             self.lyrics_wrap_font = Some(wrap_font);
             self.forget_measurements();
+            // A sheet following the sung line puts that line back in its place once the rows
+            // have their new heights. A sheet the listener scrolled is held by its top instead.
+            if self.pinned {
+                self.aiming = true;
+                self.placing = true;
+            }
             window.request_animation_frame();
         }
 
@@ -1202,7 +1280,7 @@ impl Aside {
                     let depth = verse_touch.depth;
                     // whatever the pointer rests on comes back into focus
                     let clearing = |touch: Touch, depth: f32| match (touch.waking, touch.settling) {
-                        (true, _) => depth * (1. - sharpen),
+                        (true, _) => 0.,
                         (false, true) => depth * sharpen,
                         (false, false) => depth,
                     };
@@ -1385,12 +1463,12 @@ impl Aside {
                     };
 
                     let primary = match (primary_karaoke, line.words.as_ref(), wrapped) {
-                        (true, Some(words), Some(plan)) => {
-                            karaoke_lane(plan, line.start, words, position, verse, line.voice, sung)
-                                .into_any_element()
-                        }
+                        (true, Some(words), Some(plan)) => karaoke_lane(
+                            plan, line.start, words, position, verse, line.voice, &sung,
+                        )
+                        .into_any_element(),
                         (_, _, Some(plan)) => {
-                            fixed_lyrics_lane(&plan.text, line.voice, sung).into_any_element()
+                            fixed_lyrics_lane(&plan.text, line.voice, &sung).into_any_element()
                         }
                         _ => div()
                             .child(SharedString::from(line.text.clone()))
@@ -1448,7 +1526,7 @@ impl Aside {
                                     position,
                                     dimming.filter(|_| sung_by_end),
                                     line.voice,
-                                    sung,
+                                    &sung,
                                 )
                             }),
                         );
@@ -1656,7 +1734,7 @@ impl Aside {
                                                 Some(rows) => fixed_lyrics_lane(
                                                     &rows[index],
                                                     Voice::Lead,
-                                                    sung,
+                                                    &sung,
                                                 ),
                                                 None => {
                                                     div().child(SharedString::from(line.to_owned()))
@@ -1754,6 +1832,8 @@ impl Aside {
         };
 
         let sheet = Scroller::new("lyrics", &self.verse_bar)
+            .hold_while(!self.pinned)
+            .reflowed(rewrapped)
             .bottom_inset(self.bottom(cx))
             .when(lines.is_some(), Scroller::manual_presentation)
             .when(lines.is_some(), |this| {
@@ -1854,10 +1934,23 @@ impl Aside {
         let scroll = self.verse_bar.read(cx).scroll().clone();
         let resting = scroll.offset().y;
         let nudges = self.verse_bar.read(cx).nudges();
+        // A sheet that was off screen while the song went on, behind the fullscreen player or
+        // a closed sidebar, comes back to a verse far from the one it left. It is put there
+        // rather than scrolled across everything in between.
+        let away = self.drawn.elapsed() >= AWAY;
+        self.drawn = std::time::Instant::now();
+        let far =
+            matches!((self.followed, sung), (Some(left), Some(now)) if left.abs_diff(now) > 1);
+        if away && far {
+            self.flying = false;
+            self.drifts.clear();
+            self.placing = true;
+        }
         if self.nudges != nudges {
             self.nudges = nudges;
             self.pinned = false;
             self.flying = false;
+            self.put = None;
             self.drifts.clear();
             self.nudged = Some(std::time::Instant::now());
         }
@@ -1886,13 +1979,11 @@ impl Aside {
             window.request_animation_frame();
             return;
         }
-        if !self.aiming {
-            return;
-        }
-        let Some(item) = sung.and_then(|index| scroll.bounds_for_item(index)) else {
+        let Some((row, item)) =
+            sung.and_then(|index| Some((index, scroll.bounds_for_item(index)?)))
+        else {
             return;
         };
-        self.aiming = false;
         let view = scroll.bounds();
         // Preserve the fractional target. Spring scrolls are presented by the compositor, so the
         // text never has to walk the raster grid while the layer is settling.
@@ -1902,10 +1993,30 @@ impl Aside {
             view.size.height,
             scroll.max_offset().y,
         );
+        if !self.aiming {
+            // The verse was put before its rows had their final sizes, so the place it belongs
+            // has moved under it. Put it again, without dragging the rows along.
+            let moved = self
+                .put
+                .is_some_and(|(put, at)| put == row && f32::from(goal - at).abs() > PUT_REST);
+            if moved {
+                self.flying = false;
+                self.put = Some((row, goal));
+                self.verse_bar.update(cx, |bar, _| bar.place(goal));
+            }
+            return;
+        }
+        self.aiming = false;
         self.flown(goal, scroll.offset().y);
         match std::mem::take(&mut self.placing) || cx.reduce_motion() {
-            true => self.verse_bar.update(cx, |bar, _| bar.place(goal)),
-            false => self.verse_bar.update(cx, |bar, _| bar.aim(goal, window)),
+            true => {
+                self.put = Some((row, goal));
+                self.verse_bar.update(cx, |bar, _| bar.place(goal));
+            }
+            false => {
+                self.put = None;
+                self.verse_bar.update(cx, |bar, _| bar.aim(goal, window));
+            }
         }
     }
 
@@ -1964,8 +2075,7 @@ impl Aside {
             Whence::Playlist => Destination::Playlist(id),
             Whence::Artist => Destination::Artist(id),
             Whence::Radio => Destination::Song(id),
-            Whence::Saved => Destination::Library(LibraryTab::Songs),
-            Whence::Local => Destination::Local(LibraryTab::Songs),
+            Whence::Saved | Whence::Local => Destination::Library(LibraryTab::Songs),
         };
         let name = match origin.whence {
             Whence::Saved => match Sonora::global(cx).library.read(cx).shape(Shelf::Streaming) {
@@ -1989,7 +2099,7 @@ impl Aside {
         let remote = !listing.editable();
         let from = listing
             .origin(cx)
-            .and_then(|origin| self.playing_from(origin, cx));
+            .and_then(|origin| self.playing_from(&origin, cx));
         let drop_gap = self.drop_gap;
         let upcoming = sections.upcoming;
         let audible = listing.playing;
@@ -2079,7 +2189,7 @@ impl Render for Aside {
         }
         let queue_track = listing
             .track(QueuePosition::Current, cx)
-            .and_then(|track| track.id.clone());
+            .and_then(|track| track.id);
         if self.queue_track != queue_track {
             self.queue_track = queue_track;
             self.anchor = true;
@@ -2106,6 +2216,13 @@ impl Render for Aside {
                     cx.notify();
                 }
             }))
+            .on_drag_move(
+                cx.listener(|this, _: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    if this.drop_gap.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .when(self.titled || self.tab == SideTab::Queue, |this| {
                 this.child(self.header(&sections, remote, window, cx))
             })
@@ -2118,9 +2235,14 @@ impl Render for Aside {
                     .flex_1()
                     .min_h_0()
                     .when(self.tab == SideTab::Queue && !remote, |this| {
-                        this.on_drop(
-                            cx.listener(|this, dragged: &DraggedPin, _, cx| this.land(dragged, cx)),
-                        )
+                        this.on_drop(cx.listener(|this, dragged: &DraggedPin, _, cx| {
+                            this.land(Dragged::Pin(dragged), cx)
+                        }))
+                        .on_drop(cx.listener(
+                            |this, dragged: &ExternalPaths, _, cx| {
+                                this.land(Dragged::Paths(dragged.paths()), cx)
+                            },
+                        ))
                     })
                     .when(self.tab == SideTab::Lyrics, |this| {
                         this.child(self.verses(window, cx)).child(self.witness())
@@ -2156,8 +2278,10 @@ impl Render for Aside {
                             ),
                         )
                     })
-                    .children(self.follow(cx))
-                    .children(self.recall(&sections, window, cx)),
+                    .when(self.titled, |this| {
+                        this.children(self.follow(cx))
+                            .children(self.recall(&sections, window, cx))
+                    }),
             )
             .children(self.menu(cx))
     }
@@ -2165,7 +2289,7 @@ impl Render for Aside {
 
 /// The part of a queue row that names who queued the song: a bullet, their round picture or
 /// initials, and "Added by NAME".
-fn adder(added: &Contributor, theme: ui::Theme) -> Div {
+fn adder(added: &Contributor, theme: &ui::Theme) -> Div {
     let face = theme.text(Text::Small) * ADDER_FACE;
     div()
         .flex()
@@ -2209,15 +2333,16 @@ fn source_link(name: SharedString, to: Destination, cx: &App) -> impl IntoElemen
         .text_color(theme.muted_foreground)
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
-        .hover(|style| style.text_color(theme.foreground).underline())
+        .hover(|style| style.underline())
         .link(to)
         .child(name)
+        .glowed_text(theme.muted_foreground, theme.foreground)
 }
 
 /// Rows that `lyrics_wrap_rows` already broke, one line each. They never wrap again, because at
 /// some window sizes gpui finds a row that measured as fitting a hair too wide and would push its
 /// last word onto a line of its own.
-fn fixed_lyrics_lane(rows: &[SharedString], voice: Voice, sung: Sung) -> Div {
+fn fixed_lyrics_lane(rows: &[SharedString], voice: Voice, sung: &Sung) -> Div {
     div()
         .flex()
         .flex_col()
@@ -2240,23 +2365,23 @@ pub(crate) fn verse(
     line: &music::LyricsLine,
     look: VerseLook,
     position: std::time::Duration,
-    theme: ui::Theme,
+    theme: &ui::Theme,
 ) -> Div {
     let karaoke = look.karaoke && effects();
     let ended = line_has_passed(line, position);
     let worded = karaoke && line.worded() && line.words.is_some();
     let tint = match (look.active, ended) {
-        (true, _) if worded => quiet(&theme),
+        (true, _) if worded => quiet(theme),
         (true, _) => theme.foreground,
-        (false, true) => quiet(&theme).opacity(PAST),
-        (false, false) => quiet(&theme).opacity(AHEAD),
+        (false, true) => quiet(theme).opacity(PAST),
+        (false, false) => quiet(theme).opacity(AHEAD),
     };
     let mirrored = right_to_left(&line.text);
     let sung = Sung {
         karaoke,
         lane: look.lane,
         scripts: look.scripts,
-        theme,
+        theme: *theme,
         karaoke_tint: mix(
             theme.foreground,
             tint,
@@ -2280,14 +2405,14 @@ pub(crate) fn verse(
             position,
             look.size,
             line.voice,
-            sung,
+            &sung,
         ),
         _ => lifted(
             div()
                 .w_full()
                 .when(hugs_end(line.voice, mirrored), |this| this.text_right())
                 .child(SharedString::from(line.text.clone())),
-            sung,
+            &sung,
         ),
     };
     let active_size = active_verse_size(look.size);
@@ -2318,12 +2443,12 @@ pub(crate) fn verse(
                 .child(primary)
                 .when_some(
                     selected_romanization(&line.romanized, look.scripts),
-                    |this, text| this.child(romanized_lyrics_lane(text, look.lane, &theme)),
+                    |this, text| this.child(romanized_lyrics_lane(text, look.lane, theme)),
                 )
                 .when_some(
                     selected_translation(&line.translated, look.translation),
                     |this, text| {
-                        this.child(translation_lyrics_lane(text, None, look.lane, &theme))
+                        this.child(translation_lyrics_lane(text, None, look.lane, theme))
                     },
                 ),
         )
@@ -2376,7 +2501,7 @@ fn karaoke_lane(
     position: std::time::Duration,
     verse: Pixels,
     voice: Voice,
-    sung: Sung,
+    sung: &Sung,
 ) -> Div {
     let edge_fade = verse * REVEAL;
     let Wrapped {
@@ -2552,7 +2677,7 @@ fn secondary_lyrics_lane(
     position: std::time::Duration,
     dimming: Option<u64>,
     voice: Voice,
-    sung: Sung,
+    sung: &Sung,
 ) -> gpui::AnyElement {
     let theme = &sung.theme;
     let passed = line_passed || lane.sung_end().is_some_and(|end| position >= end);
@@ -2574,13 +2699,13 @@ fn secondary_lyrics_lane(
     let size = sung.lane;
     let karaoke_capable = sung.karaoke && lane.worded();
     // a lane holds still while the line above it grows
-    let still = Sung { lift: 1., ..sung };
+    let still = Sung { lift: 1., ..*sung };
     let lyrics =
         div()
             .text_size(size)
             .map(|this| match (karaoke_capable, lane.words.as_ref(), plan) {
                 (true, Some(words), Some(plan)) => this.child(karaoke_lane(
-                    plan, lane.start, words, position, size, voice, still,
+                    plan, lane.start, words, position, size, voice, &still,
                 )),
                 (true, Some(words), None) => this.child(karaoke_lane(
                     &loose_plan(&lane.text, words),
@@ -2589,9 +2714,9 @@ fn secondary_lyrics_lane(
                     position,
                     size,
                     voice,
-                    still,
+                    &still,
                 )),
-                (_, _, Some(plan)) => this.child(fixed_lyrics_lane(&plan.text, voice, still)),
+                (_, _, Some(plan)) => this.child(fixed_lyrics_lane(&plan.text, voice, &still)),
                 _ => this.child(SharedString::from(lane.text.clone())),
             });
     let held = shade(true);
@@ -2813,7 +2938,7 @@ fn ramp(at: std::time::Instant, window: &mut Window) -> f32 {
 }
 
 /// Scales one line of text without touching the space between it and the next.
-fn lifted(row: Div, sung: Sung) -> Div {
+fn lifted(row: Div, sung: &Sung) -> Div {
     match sung.lift == 1. {
         true => row,
         false => row.layer_scale(sung.lift).layer_scale_origin(sung.from),

@@ -56,8 +56,8 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup --yes --no-progress
-          $env:SONORA_VERSION = "0.48.1"
-          @{ version = "0.48.1"; channel = "stable" } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM build.json
+          $env:SONORA_VERSION = "0.50.3"
+          @{ version = "0.50.3"; channel = "stable" } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM build.json
           $env:SONORA_BUILD_METADATA = (Resolve-Path build.json).Path
           $env:SONORA_EXE = (Resolve-Path "target/x86_64-pc-windows-msvc/release/sonora.exe").Path
           $env:SONORA_DIST = (Resolve-Path "dist").Path
@@ -75,4 +75,4 @@ jobs:
           gh release delete "$TAG" --yes --cleanup-tag || true
           gh release create "$TAG" dist/* --target "$GITHUB_SHA" --prerelease \
             --title "Sonora فارسی ($TAG)" \
-            --notes "Persian (fa) build of Sonora v0.48.1 for Windows x64."
+            --notes "Persian (fa) build of Sonora v0.50.3 for Windows x64."

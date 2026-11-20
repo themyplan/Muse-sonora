@@ -6,8 +6,8 @@ use gpui::{
 use i18n::t;
 use state::{PageWidth, SYSTEM_FONT};
 use ui::{
-    ActiveTheme as _, Button, Look, MAX_FONT, MAX_TRANSPARENCY, MIN_FONT, MenuItem, OptionCard,
-    Picker, Rounding, Scrubber, Switch, Theme, ThemeKind,
+    ActiveTheme as _, Button, Design, GlassStyle, Look, MAX_FONT, MAX_TRANSPARENCY, MIN_FONT,
+    MenuItem, OptionCard, Picker, Rounding, Scrubber, Switch, Theme, ThemeKind,
 };
 
 use super::rows::{Announced as _, grid, outward};
@@ -26,13 +26,28 @@ const TYPEFACE_GUESS: usize = 24;
 const TYPEFACE_BATCH: usize = 3;
 /// The share of a thumbnail's width the centred page takes, leaving a margin either side.
 const CENTRED_SHARE: f32 = 0.6;
+/// The pill in a glass-style preview card.
+const GLASS_PILL_W: Pixels = px(64.);
+const GLASS_PILL_H: Pixels = px(20.);
 
 impl SettingsView {
     pub(super) fn appearance_groups(&self, cx: &App) -> Vec<Group> {
-        vec![
+        let liquid = matches!(self.settings.read(cx).design(), Design::LiquidGlass);
+        let mut groups = vec![
             Group::new("settings-theme", "icons/palette.svg")
                 .cards(Slot::Theme)
                 .rows([Slot::Adaptive, Slot::CommunityThemes]),
+            Group::new("settings-design", "icons/blend.svg")
+                .cards(Slot::Design)
+                .rows([Slot::Bento]),
+        ];
+        if liquid {
+            groups.push(
+                Group::new("settings-design-glass-style", "icons/gauge.svg")
+                    .cards(Slot::GlassStyle),
+            );
+        }
+        groups.extend([
             Group::new("settings-icons", "icons/layout-grid.svg").cards(Slot::Icons),
             Group::new("settings-corners", "icons/maximize.svg").cards(Slot::Corners),
             Group::new("settings-page-width", "icons/columns-3.svg").cards(Slot::PageWidth),
@@ -44,7 +59,8 @@ impl SettingsView {
                     .chain(ui::WindowBlur::supported(cx).then_some(Slot::WindowBlur))
                     .chain([Slot::Blur]),
             ),
-        ]
+        ]);
+        groups
     }
 
     /// The look the theme is drawn from now, with the tint the adaptive theme put on it.
@@ -405,6 +421,112 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// One card per design, its thumbnail a sketch of the look: a plain panel for Classic, a
+    /// colourful field with a glass pill for Liquid Glass. The choice is saved on `AppSettings`
+    /// and the theme is rebuilt from the new look, so every surface redraws at once.
+    pub(super) fn design_cards(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let look = self.look(cx);
+        let overrides = self.settings.read(cx).theme_overrides();
+        let chosen = self.settings.read(cx).design();
+        let style = self.settings.read(cx).glass_style();
+        let height = cx.theme().metrics.list_row * 1.6;
+        let count = Design::ALL.len();
+
+        grid(count as u16, window, cx)
+            .children(
+                Design::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(place, design)| {
+                        let overrides = overrides.clone();
+                        OptionCard::new(SharedString::from(format!("design-{}", design.id())))
+                            .choice(
+                                i18n::lookup(design.key(), None),
+                                design == chosen,
+                                place,
+                                count,
+                            )
+                            .thumb_height(height)
+                            .thumb(design_sketch(design, style, cx))
+                            .label(i18n::lookup(design.key(), None))
+                            .selected(design == chosen)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings
+                                    .update(cx, |settings, cx| settings.set_design(design, cx));
+                                Theme::set(Look { design, ..look }, &overrides, cx);
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// One card per glass style, its thumbnail the same colourful field with a glass pill drawn
+    /// in that style, so Frosted shows the frosted pill and Clear the clear one. The choice is
+    /// saved on `AppSettings` and the theme is rebuilt from the new look, so every glass
+    /// surface redraws at once.
+    pub(super) fn glass_style_cards(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let look = self.look(cx);
+        let overrides = self.settings.read(cx).theme_overrides();
+        let chosen = self.settings.read(cx).glass_style();
+        let height = cx.theme().metrics.list_row * 1.6;
+        let count = GlassStyle::ALL.len();
+
+        grid(count as u16, window, cx)
+            .children(
+                GlassStyle::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(place, style)| {
+                        let overrides = overrides.clone();
+                        OptionCard::new(SharedString::from(format!(
+                            "glass-style-{}",
+                            style.id()
+                        )))
+                        .choice(
+                            i18n::lookup(style.key(), None),
+                            style == chosen,
+                            place,
+                            count,
+                        )
+                        .thumb_height(height)
+                        .thumb(glass_preview(style, cx))
+                        .label(i18n::lookup(style.key(), None))
+                        .selected(style == chosen)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings.update(cx, |settings, cx| {
+                                settings.set_glass_style(style, cx)
+                            });
+                            Theme::set(Look { glass_style: style, ..look }, &overrides, cx);
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Whether each home section renders inside its own rounded card. The switch saves the
+    /// choice and redraws every window, since the home screen reads it while rendering.
+    pub(super) fn bento_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let bento = self.settings.read(cx).bento();
+
+        self.row(
+            t!("settings-bento"),
+            Switch::new("bento", bento)
+                .name(t!("settings-bento"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| settings.set_bento(!bento, cx));
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn opacity_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let look = self.look(cx);
@@ -554,6 +676,70 @@ pub(super) fn corner(rounding: Rounding, cx: &App) -> Div {
             .border_color(theme.muted_foreground)
             .bg(theme.secondary),
     )
+}
+
+/// A thumbnail of a design: a plain panel for Classic, a colourful field with a glass pill
+/// for Liquid Glass, the pill drawn in the glass style the user picked.
+fn design_sketch(design: Design, style: GlassStyle, cx: &App) -> Div {
+    match design {
+        Design::Classic => {
+            let theme = cx.theme();
+            div().size_full().relative().child(
+                div()
+                    .absolute()
+                    .top(relative(0.2))
+                    .bottom(relative(0.2))
+                    .left(relative(0.2))
+                    .w(relative(0.6))
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary),
+            )
+        }
+        Design::LiquidGlass => glass_preview(style, cx),
+    }
+}
+
+/// A thumbnail of a glass surface: a colourful field with a glass pill floating on it. The
+/// field's two accent bands give the pill something to blur, so the Frosted pill softens the
+/// edge between them and the Clear pill keeps it sharper. The pill is drawn from the same fill
+/// and blur the app draws its liquid popovers from, so the preview shows the real treatment.
+fn glass_preview(style: GlassStyle, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (fill, blur) = match style {
+        GlassStyle::Frosted => (
+            ui::LIQUID_POPOVER_FILL,
+            ui::LIQUID_POPOVER_BLUR,
+        ),
+        GlassStyle::Clear => (
+            ui::LIQUID_POPOVER_FILL_CLEAR,
+            ui::LIQUID_POPOVER_BLUR_CLEAR,
+        ),
+    };
+
+    div()
+        .size_full()
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .child(div().flex_1().bg(theme.selection))
+                .child(div().flex_1().bg(theme.primary)),
+        )
+        .child(centred(
+            div()
+                .w(GLASS_PILL_W)
+                .h(GLASS_PILL_H)
+                .rounded_full()
+                .bg(theme.popover.opacity(fill))
+                .backdrop_blur(blur)
+                .border_1()
+                .border_color(ui::rim_color(cx)),
+        ))
 }
 
 /// A thumbnail of a wide window's content area with a page drawn across it. The centred page

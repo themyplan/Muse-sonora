@@ -123,6 +123,11 @@ pub struct Look {
     pub blur_window: bool,
     pub tint: Option<Hsla>,
     pub tint_secondary: Option<Hsla>,
+    /// How surfaces are drawn. See `ui::Design`.
+    pub design: Design,
+    /// How a liquid glass surface treats what is behind it. Only read while the design
+    /// is Liquid Glass. See `ui::GlassStyle`.
+    pub glass_style: GlassStyle,
 }
 
 /// The built-in neutral palettes. Every other theme is a theme file laid over `Dark`, and the
@@ -200,6 +205,78 @@ fn assumed() -> Option<ThemeKind> {
         1 => Some(ThemeKind::Light),
         2 => Some(ThemeKind::Dark),
         _ => None,
+    }
+}
+
+/// How surfaces are drawn: the look Sonora has today, or liquid glass. Stored by id in
+/// `settings.json`, like the page width, so an unknown id reads as Classic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Design {
+    #[default]
+    Classic,
+    LiquidGlass,
+}
+
+impl Design {
+    pub const ALL: [Self; 2] = [Self::Classic, Self::LiquidGlass];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::LiquidGlass => "liquid-glass",
+        }
+    }
+
+    /// The label's Fluent key, resolved by the view when it renders the option cards.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Classic => "settings-design-classic",
+            Self::LiquidGlass => "settings-design-liquid-glass",
+        }
+    }
+
+    /// Reads a saved design id, keeping Classic for missing or unknown choices.
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "liquid-glass" => Self::LiquidGlass,
+            _ => Self::Classic,
+        }
+    }
+}
+
+/// How a liquid glass surface treats what is behind it. Only read while the design is
+/// Liquid Glass; stored by id like the design itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GlassStyle {
+    #[default]
+    Frosted,
+    Clear,
+}
+
+impl GlassStyle {
+    pub const ALL: [Self; 2] = [Self::Frosted, Self::Clear];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Frosted => "frosted",
+            Self::Clear => "clear",
+        }
+    }
+
+    /// The label's Fluent key, resolved by the view when it renders the option cards.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Frosted => "settings-design-glass-frosted",
+            Self::Clear => "settings-design-glass-clear",
+        }
+    }
+
+    /// Reads a saved glass style id, keeping Frosted for missing or unknown choices.
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "clear" => Self::Clear,
+            _ => Self::Frosted,
+        }
     }
 }
 
@@ -440,6 +517,12 @@ pub struct Theme {
     /// The cover's runner-up hue, carried beside the lead tint for two-colour
     /// surfaces like the fullscreen ambient background. The selection itself stays single.
     pub tint_secondary: Option<Hsla>,
+    /// How surfaces are drawn. Read it through `ui::liquid_glass` rather than reaching
+    /// for the field, so every site asks the same question.
+    pub design: Design,
+    /// How a liquid glass surface treats what is behind it. Only read while the design
+    /// is Liquid Glass.
+    pub glass_style: GlassStyle,
 }
 
 impl Global for Theme {}
@@ -492,6 +575,8 @@ impl Theme {
             blur_window: false,
             tint: None,
             tint_secondary: None,
+            design: Design::Classic,
+            glass_style: GlassStyle::Frosted,
         }
     }
 
@@ -535,6 +620,8 @@ impl Theme {
             blur_window: false,
             tint: None,
             tint_secondary: None,
+            design: Design::Classic,
+            glass_style: GlassStyle::Frosted,
         }
     }
 
@@ -844,6 +931,8 @@ impl Theme {
         theme.transparent = look.transparent;
         theme.blur = look.blur;
         theme.blur_window = look.blur_window;
+        theme.design = look.design;
+        theme.glass_style = look.glass_style;
         theme.tint = look.tint;
         theme.tint_secondary = look.tint_secondary;
         theme
@@ -1032,6 +1121,8 @@ mod tests {
             blur_window: false,
             tint: Some(TINT),
             tint_secondary: None,
+            design: Design::Classic,
+            glass_style: GlassStyle::Frosted,
         };
         let overrides = ThemeOverrides {
             background: Some("#101010".to_owned()),

@@ -18,7 +18,7 @@ use i18n::t;
 use crate::artwork::{PREFETCH_REACH, Prefetch};
 use crate::drag::{Edge, drop_gap, drop_marker};
 use crate::filters::FilterChange;
-use crate::glass::{bar_surface, blurring, popover_surface};
+use crate::glass::{bar_surface, blurring, liquid_glass, popover_surface, rim_color};
 use crate::menu::{Menu, MenuItem};
 use crate::metrics::{snapped, text_width};
 use crate::motion::Glowing as _;
@@ -1274,7 +1274,10 @@ impl<S: TableSource> TableState<S> {
             .rounded_tl(top.top_left)
             .rounded_tr(top.top_right)
             .border_b_1()
-            .border_color(theme.table_row_border)
+            .border_color(match liquid_glass(cx) {
+                true => rim_color(cx),
+                false => theme.table_row_border,
+            })
             .text_color(theme.table_head_foreground)
             .on_mouse_down(
                 MouseButton::Right,

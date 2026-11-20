@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::button::Button;
-use crate::glass::{blurring, glass};
+use crate::glass::{blurring, glass, liquid_glass, rim_color};
 use crate::glide::Glide;
 use crate::motion::{Motion, Motioned as _, animates};
 use crate::theme::ActiveTheme as _;
@@ -323,6 +323,9 @@ impl RenderOnce for TabBar {
             .bg(theme.secondary)
             .border_1()
             .border_color(theme.border)
+            .when(blurred && liquid_glass(cx), |bar| {
+                bar.border_color(rim_color(cx))
+            })
             .when(blurred, |bar| bar.shadow_sm())
             .when(glassy, |bar| glass(bar, cx))
             .child(row)

@@ -87,7 +87,10 @@ pub use filters::{
 pub use flight::{Flight, Zoom};
 pub use form::{FORM_CONTEXT, Field, Form, NextField, PreviousField, Submit, step_focus};
 pub use glass::{
-    GLASS_BLUR, GLASS_FILL, bar_surface, blurring, frost, glass, popover_fill, popover_surface,
+    BENTO_PAD, BENTO_RADIUS, GLASS_BLUR, GLASS_FILL, LIQUID_POPOVER_BLUR,
+    LIQUID_POPOVER_BLUR_CLEAR, LIQUID_POPOVER_FILL, LIQUID_POPOVER_FILL_CLEAR, bar_surface,
+    bento, blurring, frost, glass, liquid_clear, liquid_glass, popover_fill, popover_surface,
+    rim_color, top_highlight_color,
 };
 pub use glide::{Glide, ScrollPosition};
 pub use hold::{Held, Hold, held};
@@ -154,8 +157,8 @@ pub use table::{
 };
 pub use tabs::{TabBar, Tabs};
 pub use theme::{
-    ActiveTheme, BACKDROP_TRANSPARENCY, COMPOSITOR_OPACITY, CoverFill, Look, MAX_FONT,
-    MAX_LYRICS_SCALE, MAX_TRANSPARENCY, MIN_FONT, MIN_LYRICS_SCALE, Theme, ThemeKind,
+    ActiveTheme, BACKDROP_TRANSPARENCY, COMPOSITOR_OPACITY, CoverFill, Design, GlassStyle, Look,
+    MAX_FONT, MAX_LYRICS_SCALE, MAX_TRANSPARENCY, MIN_FONT, MIN_LYRICS_SCALE, Theme, ThemeKind,
     ThemeOverrides, WindowBlur, backdrop,
 };
 pub use time::{clock, runtime, tabular};

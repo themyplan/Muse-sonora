@@ -628,7 +628,10 @@ impl Render for PlayerBar {
                 |this| this.when(!theme.transparent, |this| this.bg(theme.secondary)),
             )
             .border_t_1()
-            .border_color(theme.border)
+            .border_color(match transparent && ui::liquid_glass(cx) {
+                true => ui::top_highlight_color(cx),
+                false => theme.border,
+            })
             .occlude()
             .on_mouse_move(cx.listener(Self::hover));
 

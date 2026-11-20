@@ -147,7 +147,7 @@ impl Render for GenreView {
             .shelves
             .update(cx, |shelves, cx| match loading && sections.is_empty() {
                 true => shelves.pending(width, cx),
-                false => vec![shelves.render(sections, mode, width, window, cx)],
+                false => vec![shelves.render(sections, mode, false, width, window, cx)],
             });
 
         div()

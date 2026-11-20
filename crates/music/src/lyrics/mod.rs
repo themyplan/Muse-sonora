@@ -247,7 +247,8 @@ fn stretched_shout(text: &str) -> bool {
 
 /// What two sheets share when they are the same lyrics: their letters and digits, lowercased,
 /// behind what kind of sheet they are. It is written into one buffer sized for the whole sheet.
-fn fingerprint(lyrics: &Lyrics) -> String {
+/// A translation of a file's own lyrics is keyed by this, so the same words find it again.
+pub fn fingerprint(lyrics: &Lyrics) -> String {
     let trim = |print: &mut String, text: &str| {
         print.extend(
             text.chars()

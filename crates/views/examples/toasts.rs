@@ -9,7 +9,7 @@ use gpui::{
 use i18n::t;
 use router::Destination;
 use state::{Outcome, Toast, Toasts};
-use ui::{ActiveTheme as _, Button, Look, Rounding, Text, Theme, ThemeKind, eyebrow, heading};
+use ui::{ActiveTheme as _, Button, Design, GlassStyle, Look, Rounding, Text, Theme, ThemeKind, eyebrow, heading};
 use views::ToastStack;
 
 const INTER: &[u8] = include_bytes!(concat!(
@@ -251,6 +251,8 @@ fn main() {
                     blur_window: false,
                     tint: None,
                     tint_secondary: None,
+                    design: Design::Classic,
+                    glass_style: GlassStyle::Frosted,
                 },
                 &Default::default(),
                 cx,

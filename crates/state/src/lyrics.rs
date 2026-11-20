@@ -523,6 +523,7 @@ impl Lyrics {
         let stored = remembered.is_none().then(|| self.stored(&id, cx));
         let query = self.query(&track, &id, cx);
         let io = self.io.clone();
+        let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             let cached = match stored {
                 Some(stored) => stored.await,
@@ -579,6 +580,26 @@ impl Lyrics {
 
             while let Some((from, mut found)) = incoming.recv().await {
                 pending.retain(|name| Some(*name) != from);
+                // A file's own lyrics carry no translation of their own: re-attach a
+                // translation stored for these exact words before the sheet is painted,
+                // so a restart never shows the untranslated sheet or spends a request.
+                for hit in found.iter_mut().filter(|hit| hit.source == LOCAL) {
+                    if translated(&hit.lyrics) {
+                        continue;
+                    }
+                    let key = file_translation_key(&id, &hit.lyrics);
+                    let store = store.clone();
+                    let stored = cx
+                        .background_executor()
+                        .spawn(async move { store.get(&key, &[LOCAL]) })
+                        .await;
+                    let Some((stored, _)) = stored else {
+                        continue;
+                    };
+                    if let Some(stored) = stored.into_iter().next() {
+                        hit.lyrics = stored.lyrics;
+                    }
+                }
                 hits.append(&mut found);
                 let ranked = ordered(&ranking, hits.clone(), &priority, worded_first);
                 let Some(best) = ranked.first().cloned() else {
@@ -1113,8 +1134,9 @@ impl Lyrics {
 
     /// Keeps a translated sheet where the untranslated one was: on screen, in the answers
     /// held in memory, and, for a track the services may be asked about, in the cache
-    /// database, through the same unsaved path a lookup uses. A file's own lyrics are
-    /// never kept, so an edit to its tags shows on the next play.
+    /// database, through the same unsaved path a lookup uses. A file's own lyrics are kept
+    /// apart instead, keyed by the words themselves, so an edit to its tags still shows on
+    /// the next play and translates again.
     fn keep_translation(
         &mut self,
         id: String,
@@ -1124,6 +1146,21 @@ impl Lyrics {
     ) {
         let persistable = self.online(&id, cx);
         let key = persistable.then(|| self.key(&id, cx));
+        // A file's own lyrics are never kept under the track's key, so a translation for
+        // them is stored apart, keyed by the words themselves: the same words re-attach
+        // it on the next play with no request, and edited words translate again.
+        let file_pending = match untranslated.source == LOCAL {
+            true => {
+                let mut stored = untranslated.clone();
+                stored.lyrics = translated.clone();
+                Some(Sheets::unsaved(
+                    file_translation_key(&id, &untranslated.lyrics),
+                    &[stored],
+                    &[LOCAL],
+                ))
+            }
+            false => None,
+        };
         let mut changed = false;
         if let Some(hit) = self.hits.iter_mut().find(|hit| same(hit, &untranslated)) {
             hit.lyrics = translated.clone();
@@ -1139,8 +1176,16 @@ impl Lyrics {
                 }
             }
         }
+        let mut save = false;
         if let Some(pending) = pending {
             self.unsaved.push(pending);
+            save = true;
+        }
+        if let Some(pending) = file_pending {
+            self.unsaved.push(pending);
+            save = true;
+        }
+        if save {
             self.schedule_save(cx);
         }
         if changed {
@@ -1214,6 +1259,21 @@ fn translated(lyrics: &music::Lyrics) -> bool {
         music::Lyrics::Plain { translated, .. } => translated.is_some(),
         music::Lyrics::Synced { lines } => lines.iter().any(|line| line.translated.is_some()),
     }
+}
+
+/// The cache key for a translation of a file's own lyrics: the track and a hash of the words
+/// themselves. The words are the identity here, not the track: an edit to the file's tags
+/// changes the words, so the old translation no longer matches and the track is translated
+/// again. The hash is FNV-1a, hand-rolled because `DefaultHasher` is seeded at random per
+/// process and would not find the same row after a restart.
+fn file_translation_key(id: &str, lyrics: &music::Lyrics) -> String {
+    let print = music::lyrics::fingerprint(lyrics);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in id.as_bytes().iter().chain(print.as_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("file-translation:{id}:{hash:016x}")
 }
 
 /// Drops a sheet's translation, leaving the lyrics themselves alone.

@@ -34,7 +34,8 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use storage::Database;
 use ui::{
-    Layout, Look, Mode, Pace, Pin, Rounding, Saver, Sorting, Stillness, ThemeKind, ThemeOverrides,
+    Design, GlassStyle, Layout, Look, Mode, Pace, Pin, Rounding, Saver, Sorting, Stillness,
+    ThemeKind, ThemeOverrides,
 };
 
 use self::equalizer::Profile;
@@ -646,6 +647,13 @@ struct Appearance {
     rounding: String,
     /// How wide pages stretch on a wide window, by its id. See `PageWidth`.
     page_width: String,
+    /// How surfaces are drawn, by its id. See `ui::Design`.
+    design: String,
+    /// How a liquid glass surface treats what is behind it, by its id. Only read while
+    /// the design is Liquid Glass. See `ui::GlassStyle`.
+    glass_style: String,
+    /// Whether each home section renders inside its own rounded card.
+    bento: bool,
     /// Whether the app paints its frosted treatments. The key kept its old name, which stood
     /// for a blurred desktop behind the window, so a stored preference carries over.
     blur: bool,
@@ -967,6 +975,9 @@ impl Default for Appearance {
             icons: icons::BASE.to_owned(),
             rounding: Rounding::Rounded.id().to_owned(),
             page_width: PageWidth::default().id().to_owned(),
+            design: Design::default().id().to_owned(),
+            glass_style: GlassStyle::default().id().to_owned(),
+            bento: false,
             blur: true,
             blur_window: true,
             font_size: DEFAULT_FONT_SIZE,
@@ -1610,6 +1621,22 @@ impl AppSettings {
         PageWidth::from_id(&self.values.appearance.page_width)
     }
 
+    /// How surfaces are drawn. An unknown saved id reads as Classic.
+    pub fn design(&self) -> Design {
+        Design::from_id(&self.values.appearance.design)
+    }
+
+    /// How a liquid glass surface treats what is behind it. Only read while the design
+    /// is Liquid Glass. An unknown saved id reads as Frosted.
+    pub fn glass_style(&self) -> GlassStyle {
+        GlassStyle::from_id(&self.values.appearance.glass_style)
+    }
+
+    /// Whether each home section renders inside its own rounded card.
+    pub fn bento(&self) -> bool {
+        self.values.appearance.bento
+    }
+
     /// Whether the app paints its frosted treatments. See `ui::blurring`.
     pub fn blur(&self) -> bool {
         self.values.appearance.blur
@@ -1651,6 +1678,8 @@ impl AppSettings {
             blur_window: self.blur_window(),
             tint: None,
             tint_secondary: None,
+            design: self.design(),
+            glass_style: self.glass_style(),
         }
     }
 
@@ -2627,6 +2656,38 @@ impl AppSettings {
             return;
         }
         self.values.appearance.page_width = width.id().to_owned();
+        cx.refresh_windows();
+        self.schedule_save(cx);
+    }
+
+    /// Saves the design and redraws every window, since each surface reads it while rendering.
+    pub fn set_design(&mut self, design: Design, cx: &mut Context<Self>) {
+        if self.design() == design {
+            return;
+        }
+        self.values.appearance.design = design.id().to_owned();
+        cx.refresh_windows();
+        self.schedule_save(cx);
+    }
+
+    /// Saves the glass style and redraws every window, since each glass surface reads it
+    /// while rendering.
+    pub fn set_glass_style(&mut self, style: GlassStyle, cx: &mut Context<Self>) {
+        if self.glass_style() == style {
+            return;
+        }
+        self.values.appearance.glass_style = style.id().to_owned();
+        cx.refresh_windows();
+        self.schedule_save(cx);
+    }
+
+    /// Saves the bento layout and redraws every window, since the home screen reads it while
+    /// rendering.
+    pub fn set_bento(&mut self, bento: bool, cx: &mut Context<Self>) {
+        if self.bento() == bento {
+            return;
+        }
+        self.values.appearance.bento = bento;
         cx.refresh_windows();
         self.schedule_save(cx);
     }

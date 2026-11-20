@@ -9,7 +9,8 @@ use std::rc::Rc;
 use music::{GenreItem, GenreSection};
 use state::Playback;
 use ui::{
-    ActiveTheme as _, Button, Card, Deck, Glide, Hold, Mode, Skeleton, Text, heading, snapped,
+    ActiveTheme as _, BENTO_PAD, Button, Card, Deck, Glide, Hold, Mode, Skeleton, Text, heading,
+    snapped,
 };
 
 use crate::shared::album_grid::CardGrid;
@@ -88,10 +89,12 @@ impl Shelves {
     }
 
     /// Virtualizes full-width sections while keeping headings and lists inside the content inset.
+    /// With bento on, each section renders inside its own rounded card instead.
     pub(crate) fn render(
         &mut self,
         sections: Rc<Vec<GenreSection>>,
         mode: Mode,
+        bento: bool,
         width: Pixels,
         window: &Window,
         cx: &mut Context<Self>,
@@ -107,7 +110,7 @@ impl Shelves {
 
         let heights: Vec<Pixels> = sections
             .iter()
-            .map(|section| self.height(section, mode, width, window, cx))
+            .map(|section| self.height(section, mode, bento, width, window, cx))
             .collect();
         let me = cx.entity().downgrade();
 
@@ -126,15 +129,18 @@ impl Shelves {
                 let shelves = view.read(cx);
 
                 match mode {
-                    Mode::Grid => shelves.rail(place, &sections, width, &holder, window, cx),
-                    Mode::List => shelves.lane(place, section, width, window, cx),
+                    Mode::Grid => {
+                        shelves.rail(place, &sections, bento, width, &holder, window, cx)
+                    }
+                    Mode::List => shelves.lane(place, section, bento, width, window, cx),
                 }
             });
 
-        // Sections span the page so the deck's row clips do not cut off sideways cards.
+        // Sections span the page so the deck's row clips do not cut off sideways cards. A
+        // bento section stays inside the content inset instead, so its card has room around it.
         div()
             .relative()
-            .mx(-cx.theme().metrics.inset)
+            .when(!bento, |this| this.mx(-cx.theme().metrics.inset))
             .child(stack)
             .into_any_element()
     }
@@ -143,6 +149,7 @@ impl Shelves {
         &self,
         section: &GenreSection,
         mode: Mode,
+        bento: bool,
         width: Pixels,
         window: &Window,
         cx: &App,
@@ -159,7 +166,12 @@ impl Shelves {
             }
         };
 
-        head + body
+        head
+            + body
+            + match bento {
+                true => BENTO_PAD * 2.,
+                false => px(0.),
+            }
     }
 
     /// Lays out a section as inset columns without horizontal scrolling.
@@ -167,12 +179,17 @@ impl Shelves {
         &self,
         place: usize,
         section: &GenreSection,
+        bento: bool,
         width: Pixels,
         window: &Window,
         cx: &App,
     ) -> AnyElement {
         let lanes = lanes(width);
         let total = section.items.len().min(lanes * ROWS);
+        let pad = match bento {
+            true => BENTO_PAD,
+            false => cx.theme().metrics.inset,
+        };
         let cards = section
             .items
             .iter()
@@ -186,11 +203,12 @@ impl Shelves {
             })
             .collect();
 
-        div()
+        let lane = div()
             .flex()
             .flex_col()
-            .px(cx.theme().metrics.inset)
+            .px(pad)
             .gap_3()
+            .when(bento, |this| this.py(BENTO_PAD))
             .child(
                 div()
                     .flex()
@@ -202,17 +220,22 @@ impl Shelves {
                         cx,
                     )),
             )
-            .child(spread(cards, lanes))
-            .into_any_element()
+            .child(spread(cards, lanes));
+        match bento {
+            true => ui::bento(lane, cx).into_any_element(),
+            false => lane.into_any_element(),
+        }
     }
 
     /// A section's heading over its cards in a sideways scroller. The scroller reaches past the
     /// content by the page inset on either side and fades its cards out across that inset, so
-    /// at rest the fades lie over empty room.
+    /// at rest the fades lie over empty room. With bento on, the card's own padding takes the
+    /// inset's place, and the section draws inside its own rounded card.
     fn rail(
         &self,
         place: usize,
         sections: &Rc<Vec<GenreSection>>,
+        bento: bool,
         width: Pixels,
         me: &WeakEntity<Self>,
         window: &Window,
@@ -229,15 +252,20 @@ impl Shelves {
         let card = layout.card;
         let tall = Card::tile_height(card, window, cx);
         let inset = cx.theme().metrics.inset;
+        let pad = match bento {
+            true => BENTO_PAD,
+            false => inset,
+        };
 
-        div()
+        let rail = div()
             .flex()
             .flex_col()
             .gap_3()
+            .when(bento, |this| this.py(BENTO_PAD))
             .child(
                 div()
                     .flex()
-                    .px(cx.theme().metrics.inset)
+                    .px(pad)
                     .items_end()
                     .justify_between()
                     .gap_4()
@@ -258,9 +286,9 @@ impl Shelves {
                 div()
                     .id((self.id, place))
                     .w_full()
-                    .px(inset)
+                    .px(pad)
                     .h(tall)
-                    .fade_sides(inset, inset)
+                    .fade_sides(pad, pad)
                     .overflow_x_scroll()
                     .restrict_scroll_to_axis()
                     .track_scroll(&handle)
@@ -299,8 +327,11 @@ impl Shelves {
                                     .into_any_element()
                             }),
                     ),
-            ))
-            .into_any_element()
+            ));
+        match bento {
+            true => ui::bento(rail, cx).into_any_element(),
+            false => rail.into_any_element(),
+        }
     }
 
     fn arrows(

@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Choose between the Classic look and Liquid Glass in Settings → Appearance, with Frosted or Clear glass.
+- Turn on the Bento layout in Settings → Appearance to show each home section inside its own rounded card.
+- Songs you open straight from disk now join your library, so they stay there after a restart without another scan.
+- Lyrics translations are now kept for songs whose lyrics come from the file itself, so they show again after a restart without another request.
+
 ## [0.50.3] - 2026-11-20
 
 ### Changed

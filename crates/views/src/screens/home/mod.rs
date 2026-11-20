@@ -205,11 +205,12 @@ impl Render for HomeView {
         let sections = self.home.read(cx).sections();
         let feeding = self.home.read(cx).is_feeding();
         let width = self.width;
+        let bento = Sonora::global(cx).settings.read(cx).bento();
         let shelves = self
             .shelves
             .update(cx, |shelves, cx| match sections.is_empty() && feeding {
                 true => shelves.pending(width, cx),
-                false => vec![shelves.render(sections, Mode::Grid, width, window, cx)],
+                false => vec![shelves.render(sections, Mode::Grid, bento, width, window, cx)],
             });
 
         Scroller::new("home-page", &self.scrollbar)
@@ -222,7 +223,16 @@ impl Render for HomeView {
                     .flex()
                     .flex_col()
                     .gap_8()
-                    .child(ui::held("home-quick-picks", picks))
+                    .child(match bento {
+                        true => ui::bento(
+                            div()
+                                .p(ui::BENTO_PAD)
+                                .child(ui::held("home-quick-picks", picks)),
+                            cx,
+                        )
+                        .into_any_element(),
+                        false => ui::held("home-quick-picks", picks).into_any_element(),
+                    })
                     .children(shelves),
             )
             .when_some(context_menu, |this, menu| this.child(menu))

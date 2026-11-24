@@ -310,16 +310,16 @@ pub fn perched(button: Button, cx: &App) -> Div {
         .flex()
         .justify_center()
         .child(
-            liquid_motion(
-                div().flex().flex_none().block_mouse_except_scroll().child(
+            div().flex().flex_none().block_mouse_except_scroll().child(
+                liquid_motion(
                     button
                         .ghost()
                         .small()
                         .rounded_full()
                         .border_1()
                         .border_color(theme.border),
+                    cx,
                 ),
-                cx,
             ),
         )
 }

@@ -731,7 +731,7 @@ fn glass_preview(style: GlassStyle, cx: &App) -> Div {
                 .child(div().flex_1().bg(theme.primary)),
         )
         .child(centred(
-            ui::liquid_motion(
+            ui::liquid_hover(
                 div()
                     .w(GLASS_PILL_W)
                     .h(GLASS_PILL_H)

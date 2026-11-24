@@ -213,7 +213,15 @@ pub fn liquid_motion<E: Styled + InteractiveElement + StatefulInteractiveElement
     }
 }
 
-/// Styles an element as frosted glass: a faint popover fill over a hard blur of
+/// The hover lift of a liquid surface that is not itself a control: a slight
+/// scale up under the pointer. Panels are plain divs, which do not carry the
+/// press state a control does, so they lift but never dip.
+pub fn liquid_hover<E: Styled + InteractiveElement>(element: E, cx: &App) -> E {
+    match liquid_glass(cx) {
+        true => element.hover(|style| style.layer_scale(LIQUID_HOVER_SCALE)),
+        false => element,
+    }
+}
 /// whatever it floats on. Over a flat colour the blur shows nothing, so the fill is all
 /// that separates the control from the page there. A site the blur setting reaches asks
 /// `blurring` before calling this, since the thin fill needs the wash to read.

@@ -1,6 +1,6 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Background, BoxShadow, Div, Hsla, InteractiveElement, ObjectFit, Pixels,
+    App, Background, BoxShadow, Hsla, InteractiveElement, ObjectFit, ParentElement, Pixels,
     StatefulInteractiveElement, div, img, linear_color_stop, linear_gradient, px,
 };
 
@@ -129,7 +129,7 @@ fn liquid_shadow(cx: &App) -> BoxShadow {
 /// reading as flat plastic. The strips are absolutely positioned, so they
 /// never move the panel's own content, and they take the panel's radius so
 /// they never poke past its corners.
-fn liquid_overlays(element: Div, cx: &App, radius: Pixels) -> Div {
+fn liquid_overlays<E: Styled + ParentElement>(element: E, cx: &App, radius: Pixels) -> E {
     let theme = cx.theme();
     let mut bottom = theme.popover;
     bottom.l = (bottom.l * 0.8).clamp(0., 1.);
@@ -270,7 +270,7 @@ pub fn popover_fill(cx: &App) -> Hsla {
 /// sheen and a pill radius, so a menu reads as a glass pill over the page. It also
 /// carries the liquid overlays — the bright top edge, the darker foot and the grain —
 /// and a soft shadow, so the panel lifts off the page.
-pub fn popover_surface(element: Div, cx: &App) -> Div {
+pub fn popover_surface<E: Styled + ParentElement>(element: E, cx: &App) -> E {
     let element = element
         .bg(popover_fill(cx))
         .text_color(cx.theme().popover_foreground);
@@ -305,7 +305,7 @@ pub fn popover_surface(element: Div, cx: &App) -> Div {
 /// the bar lets the desktop through about as much as the page does. With liquid glass the fill
 /// thins further and the blur widens, so the page shows through the bar. The fill leans toward
 /// the theme's accent, and the bar carries the liquid overlays and a soft shadow.
-pub fn bar_surface(element: Div, cx: &App) -> Div {
+pub fn bar_surface<E: Styled + ParentElement>(element: E, cx: &App) -> E {
     let theme = cx.theme();
     match liquid_glass(cx) {
         true => {
@@ -350,7 +350,7 @@ pub fn frost<E: Styled>(element: E) -> E {
 /// secondary surface with the theme border. It sets no text colour, so the content inside
 /// keeps the page's own colours. With liquid glass it also carries the liquid overlays
 /// and a soft shadow.
-pub fn bento(element: Div, cx: &App) -> Div {
+pub fn bento<E: Styled + ParentElement>(element: E, cx: &App) -> E {
     let theme = cx.theme();
     let element = element.rounded(BENTO_RADIUS).border_1();
     match liquid_glass(cx) {

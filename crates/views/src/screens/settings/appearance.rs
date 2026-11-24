@@ -731,14 +731,17 @@ fn glass_preview(style: GlassStyle, cx: &App) -> Div {
                 .child(div().flex_1().bg(theme.primary)),
         )
         .child(centred(
-            div()
-                .w(GLASS_PILL_W)
-                .h(GLASS_PILL_H)
-                .rounded_full()
-                .bg(ui::liquid_sheen(cx, fill))
-                .backdrop_blur(blur)
-                .border_1()
-                .border_color(ui::rim_color(cx)),
+            ui::liquid_motion(
+                div()
+                    .w(GLASS_PILL_W)
+                    .h(GLASS_PILL_H)
+                    .rounded_full()
+                    .bg(ui::liquid_sheen(cx, fill))
+                    .backdrop_blur(blur)
+                    .border_1()
+                    .border_color(ui::rim_color(cx)),
+                cx,
+            ),
         ))
 }
 

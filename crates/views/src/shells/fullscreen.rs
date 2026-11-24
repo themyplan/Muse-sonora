@@ -1513,6 +1513,54 @@ impl Render for FullscreenView {
             false => Vec::new(),
         };
 
+        // The fake in-app blur liquid glass paints under its panels: the current
+        // cover, drawn small and stretched back over the stage, blurred hard and
+        // darkened, so the glass controls frost over the art itself rather than
+        // over a flat colour. The art is drawn at a quarter of the window and
+        // scaled back up, the way the ambient field shrinks its own shader, so a
+        // weak GPU pays for a small blur, not a full-screen one. Only while liquid
+        // glass is on: without blur the panels are flat fills and the wash would
+        // only muddy the stage.
+        let wash_cover = self
+            .playback
+            .read(cx)
+            .shown_track(cx)
+            .and_then(|track| track.cover);
+        let wash = match (ui::liquid_glass(cx), wash_cover) {
+            (true, Some(cover)) => {
+                let side = viewport.width.max(viewport.height) / 4.;
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size(side)
+                                .layer_scale(4.)
+                                .layer_scale_origin(point(0., 0.))
+                                .blur(px(16.))
+                                .opacity(0.4)
+                                .child(
+                                    Artwork::new(Some(cover))
+                                        .size(side)
+                                        .corner_radius(px(0.)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .bg(theme.background.opacity(0.45)),
+                        ),
+                )
+            }
+            _ => None,
+        };
+
         div()
             .id("fullscreen")
             .role(Role::Main)
@@ -1561,6 +1609,7 @@ impl Render for FullscreenView {
             .on_action(
                 cx.listener(|this, _: &ToggleQueue, _, cx| this.toggle_panel(SideTab::Queue, cx)),
             )
+            .when_some(wash, |this, wash| this.child(wash))
             .child(
                 canvas(move |bounds, _, _| root_bounds.set(bounds), |_, _, _, _| {})
                     .absolute()

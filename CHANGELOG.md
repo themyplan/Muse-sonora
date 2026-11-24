@@ -17,6 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Liquid Glass is stronger: brighter rims, harder blur, thinner fills and a top-lit sheen on glass pills.
+- Liquid Glass feels closer to real glass: fills lean toward the accent colour, panels carry a bright top edge, a darker foot, faint grain and a soft shadow, glass controls lift on hover and dip on press, and the fullscreen player blurs the cover behind its glass.
 
 ### Fixed
 

@@ -1,7 +1,35 @@
 use gpui::prelude::*;
-use gpui::{App, Background, Hsla, Pixels, linear_color_stop, linear_gradient, px};
+use gpui::{
+    App, Background, BoxShadow, Div, Hsla, InteractiveElement, ObjectFit, Pixels, div, img,
+    linear_color_stop, linear_gradient, px,
+};
 
+use crate::motion::mix;
 use crate::theme::{ActiveTheme as _, Design, GlassStyle};
+
+/// The tiled grain liquid glass lays over its fill, so the surface reads as
+/// glass rather than flat plastic. It is registered in the app's assets as
+/// `images/noise.png` and drawn at a few percent opacity.
+const NOISE: &str = "images/noise.png";
+/// How far a liquid fill leans from the neutral popover colour toward the
+/// theme's accent, so glass is tinted instead of grey.
+const LIQUID_TINT_MIX: f32 = 0.3;
+/// The bright top edge of a liquid surface, as a share of the rim colour.
+const LIQUID_RIM_TOP: f32 = 0.35;
+/// The noise a liquid surface carries, as a share of full strength.
+const LIQUID_NOISE: f32 = 0.03;
+/// How tall the bright band across a liquid surface's top edge is.
+const HIGHLIGHT_H: Pixels = px(2.);
+/// How tall the darker wash across a liquid surface's bottom edge is.
+const SHADE_H: Pixels = px(10.);
+/// How far a liquid surface's soft shadow sits below it, and how far it blurs.
+const LIQUID_SHADOW_Y: Pixels = px(8.);
+const LIQUID_SHADOW_BLUR: Pixels = px(24.);
+/// How much of the shadow colour a liquid surface's soft shadow keeps.
+const LIQUID_SHADOW_ALPHA: f32 = 0.25;
+/// The hover lift and press dip of a liquid control, as a share of its size.
+const LIQUID_HOVER_SCALE: f32 = 1.02;
+const LIQUID_PRESS_SCALE: f32 = 0.97;
 
 /// How much of the popover colour a glass control keeps over what it blurs.
 pub const GLASS_FILL: f32 = 0.2;
@@ -76,17 +104,110 @@ pub fn top_highlight_color(cx: &App) -> Hsla {
     cx.theme().popover_foreground.opacity(0.8)
 }
 
+/// The fill colour of a liquid surface: the popover colour leaned toward the
+/// theme's accent, so glass is tinted instead of grey. The accent is the
+/// theme's own primary, which the adaptive theme already washes toward the
+/// cover, so a track's art tints its glass.
+pub fn liquid_fill_color(cx: &App, fill: f32) -> Hsla {
+    let theme = cx.theme();
+    mix(theme.popover, theme.primary, LIQUID_TINT_MIX).opacity(fill)
+}
+
+/// The soft shadow a liquid surface throws: wide, blurred and dark, so the
+/// panel lifts off the page instead of sitting flat on it. The colour is the
+/// theme's background driven to black, so no new colour is introduced.
+fn liquid_shadow(cx: &App) -> BoxShadow {
+    let mut black = cx.theme().background;
+    black.l = 0.;
+    BoxShadow::new(px(0.), LIQUID_SHADOW_Y, black.opacity(LIQUID_SHADOW_ALPHA))
+        .blur_radius(LIQUID_SHADOW_BLUR)
+}
+
+/// The bright band, darker foot and grain a liquid panel carries over its
+/// fill: a highlight across the top edge fading down, a darker wash across
+/// the bottom edge, and a faint tiled noise that keeps the glass from
+/// reading as flat plastic. The strips are absolutely positioned, so they
+/// never move the panel's own content, and they take the panel's radius so
+/// they never poke past its corners.
+fn liquid_overlays(element: Div, cx: &App, radius: Pixels) -> Div {
+    let theme = cx.theme();
+    let mut bottom = theme.popover;
+    bottom.l = (bottom.l * 0.8).clamp(0., 1.);
+    element
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(HIGHLIGHT_H)
+                .rounded_tl(radius)
+                .rounded_tr(radius)
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(
+                        theme.popover_foreground.opacity(LIQUID_RIM_TOP),
+                        0.,
+                    ),
+                    linear_color_stop(theme.popover_foreground.opacity(0.), 1.),
+                )),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(SHADE_H)
+                .rounded_bl(radius)
+                .rounded_br(radius)
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(bottom.opacity(0.), 0.),
+                    linear_color_stop(bottom.opacity(0.3), 1.),
+                )),
+        )
+        .child(
+            img(NOISE)
+                .absolute()
+                .inset_0()
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .rounded(radius)
+                .opacity(LIQUID_NOISE),
+        )
+}
+
 /// The sheen on a liquid pill: a top-lit gradient over the same fill, bright at the top
 /// fading to the fill, so the surface reads as light catching glass rather than a flat
 /// tint. Both stops come from the popover colour, so the sheen follows the theme. The
 /// settings preview draws its pill from this too, so the preview shows the real treatment.
+/// The foot of the gradient is the popover darkened, so the pill carries depth at the
+/// bottom as well as light at the top.
 pub fn liquid_sheen(cx: &App, fill: f32) -> Background {
     let popover = cx.theme().popover;
+    let mut bottom = popover;
+    bottom.l = (bottom.l * 0.8).clamp(0., 1.);
     linear_gradient(
         180.,
         linear_color_stop(popover.opacity((fill + 0.3).min(1.)), 0.),
-        linear_color_stop(popover.opacity(fill), 1.),
+        linear_color_stop(bottom.opacity(fill), 1.),
     )
+}
+
+/// The hover lift and press dip of a liquid control: a slight scale up under
+/// the pointer and a slight dip while pressed, so glass feels alive rather
+/// than painted on. The scale is a paint-only transform, so layout never
+/// moves, and GPUI applies state styles at once — the ease comes from the
+/// springs the controls already ride, not from this helper.
+pub fn liquid_motion<E: Styled + InteractiveElement>(element: E, cx: &App) -> E {
+    match liquid_glass(cx) {
+        true => element
+            .hover(|style| style.layer_scale(LIQUID_HOVER_SCALE))
+            .active(|style| style.layer_scale(LIQUID_PRESS_SCALE)),
+        false => element,
+    }
 }
 
 /// Styles an element as frosted glass: a faint popover fill over a hard blur of
@@ -103,7 +224,7 @@ pub fn glass<E: Styled>(element: E, cx: &App) -> E {
                 false => (LIQUID_FILL, LIQUID_BLUR),
             };
             element
-                .bg(theme.popover.opacity(fill))
+                .bg(liquid_fill_color(cx, fill))
                 .backdrop_blur(blur)
                 .border_1()
                 .border_color(rim_color(cx))
@@ -120,10 +241,13 @@ pub fn popover_fill(cx: &App) -> Hsla {
     let theme = cx.theme();
     match blurring(cx) {
         true => match liquid_glass(cx) {
-            true => theme.popover.opacity(match liquid_clear(cx) {
-                true => LIQUID_POPOVER_FILL_CLEAR,
-                false => LIQUID_POPOVER_FILL,
-            }),
+            true => liquid_fill_color(
+                cx,
+                match liquid_clear(cx) {
+                    true => LIQUID_POPOVER_FILL_CLEAR,
+                    false => LIQUID_POPOVER_FILL,
+                },
+            ),
             false => theme.popover.opacity(POPOVER_FILL),
         },
         false => theme.popover,
@@ -132,8 +256,10 @@ pub fn popover_fill(cx: &App) -> Hsla {
 
 /// Gives a raised panel the same fill, foreground and backdrop blur as a context menu.
 /// With liquid glass it thins the fill, blurs harder, and gains a bright rim, a top-lit
-/// sheen and a pill radius, so a menu reads as a glass pill over the page.
-pub fn popover_surface<E: Styled>(element: E, cx: &App) -> E {
+/// sheen and a pill radius, so a menu reads as a glass pill over the page. It also
+/// carries the liquid overlays — the bright top edge, the darker foot and the grain —
+/// and a soft shadow, so the panel lifts off the page.
+pub fn popover_surface(element: Div, cx: &App) -> Div {
     let element = element
         .bg(popover_fill(cx))
         .text_color(cx.theme().popover_foreground);
@@ -144,12 +270,17 @@ pub fn popover_surface<E: Styled>(element: E, cx: &App) -> E {
                     true => (LIQUID_POPOVER_FILL_CLEAR, LIQUID_POPOVER_BLUR_CLEAR),
                     false => (LIQUID_POPOVER_FILL, LIQUID_POPOVER_BLUR),
                 };
-                element
-                    .bg(liquid_sheen(cx, fill))
-                    .backdrop_blur(blur)
-                    .border_1()
-                    .border_color(rim_color(cx))
-                    .rounded(LIQUID_RADIUS)
+                liquid_overlays(
+                    element
+                        .bg(liquid_sheen(cx, fill))
+                        .backdrop_blur(blur)
+                        .border_1()
+                        .border_color(rim_color(cx))
+                        .rounded(LIQUID_RADIUS)
+                        .shadow(vec![liquid_shadow(cx)]),
+                    cx,
+                    LIQUID_RADIUS,
+                )
             }
             false => frost(element),
         },
@@ -161,8 +292,9 @@ pub fn popover_surface<E: Styled>(element: E, cx: &App) -> E {
 /// popover fill over a wide blur. The caller asks `blurring` first, since without the blur the
 /// thin fill would leave the text on the bare page. A see-through window gets a thinner fill so
 /// the bar lets the desktop through about as much as the page does. With liquid glass the fill
-/// thins further and the blur widens, so the page shows through the bar.
-pub fn bar_surface<E: Styled>(element: E, cx: &App) -> E {
+/// thins further and the blur widens, so the page shows through the bar. The fill leans toward
+/// the theme's accent, and the bar carries the liquid overlays and a soft shadow.
+pub fn bar_surface(element: Div, cx: &App) -> Div {
     let theme = cx.theme();
     match liquid_glass(cx) {
         true => {
@@ -173,9 +305,14 @@ pub fn bar_surface<E: Styled>(element: E, cx: &App) -> E {
                     false => (LIQUID_BAR_FILL, LIQUID_BAR_BLUR),
                 },
             };
-            element
-                .bg(theme.popover.opacity(fill))
-                .backdrop_blur(blur)
+            liquid_overlays(
+                element
+                    .bg(liquid_fill_color(cx, fill))
+                    .backdrop_blur(blur)
+                    .shadow(vec![liquid_shadow(cx)]),
+                cx,
+                px(0.),
+            )
         }
         false => {
             let fill = match theme.transparent {
@@ -200,8 +337,9 @@ pub fn frost<E: Styled>(element: E) -> E {
 /// Styles an element as a bento box: its own rounded surface with a gap around it. With
 /// liquid glass it is a glass pill over the page, with a bright rim; otherwise a plain
 /// secondary surface with the theme border. It sets no text colour, so the content inside
-/// keeps the page's own colours.
-pub fn bento<E: Styled>(element: E, cx: &App) -> E {
+/// keeps the page's own colours. With liquid glass it also carries the liquid overlays
+/// and a soft shadow.
+pub fn bento(element: Div, cx: &App) -> Div {
     let theme = cx.theme();
     let element = element.rounded(BENTO_RADIUS).border_1();
     match liquid_glass(cx) {
@@ -210,10 +348,15 @@ pub fn bento<E: Styled>(element: E, cx: &App) -> E {
                 true => (LIQUID_POPOVER_FILL_CLEAR, LIQUID_POPOVER_BLUR_CLEAR),
                 false => (LIQUID_POPOVER_FILL, LIQUID_POPOVER_BLUR),
             };
-            element
-                .bg(liquid_sheen(cx, fill))
-                .backdrop_blur(blur)
-                .border_color(rim_color(cx))
+            liquid_overlays(
+                element
+                    .bg(liquid_sheen(cx, fill))
+                    .backdrop_blur(blur)
+                    .border_color(rim_color(cx))
+                    .shadow(vec![liquid_shadow(cx)]),
+                cx,
+                BENTO_RADIUS,
+            )
         }
         false => element
             .bg(theme.secondary)

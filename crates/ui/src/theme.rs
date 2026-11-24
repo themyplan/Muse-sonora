@@ -924,7 +924,14 @@ impl Theme {
         theme.radius = look.rounding.radius();
         theme = theme.with_overrides(overrides);
         if look.transparent {
-            theme.see_through(1. - look.transparency.clamp(0., MAX_TRANSPARENCY));
+            // Liquid glass keeps less of the window's own fill than a plain look,
+            // so the desktop shows through about as much as the page does: a
+            // tint of forty to sixty percent, never the nearly opaque default.
+            let transparency = match look.design {
+                Design::LiquidGlass => look.transparency.clamp(0.4, 0.6),
+                _ => look.transparency,
+            };
+            theme.see_through(1. - transparency.clamp(0., MAX_TRANSPARENCY));
         }
         theme.font_size = base;
         theme.metrics = Metrics::new(base);

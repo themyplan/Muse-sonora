@@ -7,6 +7,9 @@ include!(concat!(env!("OUT_DIR"), "/fonts.rs"));
 
 /// Where About asks for the app icon, and the icon this platform shows for the app.
 const APP_ICON: &str = "brand/sonora.svg";
+/// The tiled grain liquid glass lays over its fill.
+const NOISE: &str = "images/noise.png";
+const NOISE_PNG: &[u8] = include_bytes!("../../../assets/images/noise.png");
 #[cfg(target_os = "macos")]
 const APP_ICON_SVG: &[u8] = include_bytes!("../../../assets/macos/sonora.svg");
 #[cfg(target_os = "windows")]
@@ -73,6 +76,9 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if path == APP_ICON {
             return Ok(Some(Cow::Borrowed(APP_ICON_SVG)));
+        }
+        if path == NOISE {
+            return Ok(Some(Cow::Borrowed(NOISE_PNG)));
         }
         if let Some(bytes) = icons::asset(path) {
             return Ok(Some(Cow::Borrowed(bytes)));

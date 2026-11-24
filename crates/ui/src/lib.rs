@@ -89,8 +89,8 @@ pub use form::{FORM_CONTEXT, Field, Form, NextField, PreviousField, Submit, step
 pub use glass::{
     BENTO_PAD, BENTO_RADIUS, GLASS_BLUR, GLASS_FILL, LIQUID_POPOVER_BLUR,
     LIQUID_POPOVER_BLUR_CLEAR, LIQUID_POPOVER_FILL, LIQUID_POPOVER_FILL_CLEAR, bar_surface,
-    bento, blurring, frost, glass, liquid_clear, liquid_glass, liquid_sheen, popover_fill,
-    popover_surface, rim_color, top_highlight_color,
+    bento, blurring, frost, glass, liquid_clear, liquid_fill_color, liquid_glass, liquid_motion,
+    liquid_sheen, popover_fill, popover_surface, rim_color, top_highlight_color,
 };
 pub use glide::{Glide, ScrollPosition};
 pub use hold::{Held, Hold, held};

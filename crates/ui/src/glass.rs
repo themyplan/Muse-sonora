@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Background, BoxShadow, Div, Hsla, InteractiveElement, ObjectFit, Pixels, div, img,
-    linear_color_stop, linear_gradient, px,
+    App, Background, BoxShadow, Div, Hsla, InteractiveElement, ObjectFit, Pixels,
+    StatefulInteractiveElement, div, img, linear_color_stop, linear_gradient, px,
 };
 
 use crate::motion::mix;
@@ -201,7 +201,10 @@ pub fn liquid_sheen(cx: &App, fill: f32) -> Background {
 /// than painted on. The scale is a paint-only transform, so layout never
 /// moves, and GPUI applies state styles at once — the ease comes from the
 /// springs the controls already ride, not from this helper.
-pub fn liquid_motion<E: Styled + InteractiveElement>(element: E, cx: &App) -> E {
+pub fn liquid_motion<E: Styled + InteractiveElement + StatefulInteractiveElement>(
+    element: E,
+    cx: &App,
+) -> E {
     match liquid_glass(cx) {
         true => element
             .hover(|style| style.layer_scale(LIQUID_HOVER_SCALE))
